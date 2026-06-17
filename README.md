@@ -2,7 +2,7 @@
 
 ## Use ALL the GPUs!
 
-Multi-GPU Orchestrator turns one ComfyUI session into a smart multi-GPU routing system. Perfect for cloud clusters (Vast.AI, Runpod) and CUDA-rich powerusers, unlock maximum resource utilization by dispatching workflows across every GPU on your system. All you have to do is click the "► Run" button.  
+Multi-GPU Orchestrator turns one ComfyUI session into a smart multi-GPU routing system. Perfect for cloud clusters (Vast.AI, Runpod) and CUDA-rich powerusers. Unlock maximum resource utilization by dispatching workflows across every GPU on your system. All you have to do is click the "► Run" button.  
 
 - One ComfyUI instance controls all GPUs.
 - No workflow changes or added configuration required.
