@@ -349,50 +349,30 @@ function installMultiGpuMenu(originalFetchApi) {
   const style = document.createElement("style");
   style.textContent = `
     #mgpu-sidebar-button {
-      width: 50px;
-      min-height: 56px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 5px;
-      color: var(--fg-color, #a7a7a7);
-      background: transparent;
-      border: 0;
-      padding: 6px 0;
-      cursor: pointer;
-      font: inherit;
-      font-size: 11px;
-      line-height: 1.1;
+      width: 100%;
     }
-    #mgpu-sidebar-button svg {
-      width: 21px;
-      height: 21px;
+    #mgpu-sidebar-button .side-bar-button-icon {
+      width: 1rem;
+      height: 1rem;
       fill: currentColor;
     }
-    #mgpu-sidebar-button:hover,
     #mgpu-sidebar-button[data-open="true"] {
-      color: var(--fg-color, #f2f2f2);
-      background: rgba(255, 255, 255, 0.07);
-    }
-    #mgpu-sidebar-button.mgpu-sidebar-fixed {
-      position: fixed;
-      z-index: 9997;
-      left: 0;
-      top: 404px;
+      background: var(--secondary-background-hover, rgba(255, 255, 255, 0.08));
+      color: var(--fg-color, currentColor);
     }
     #mgpu-menu-panel {
       position: fixed;
       z-index: 9998;
-      width: min(344px, calc(100vw - 72px));
-      max-height: min(620px, calc(100vh - 24px));
+      top: 0;
+      bottom: 0;
+      width: min(360px, calc(100vw - 58px));
       display: flex;
       flex-direction: column;
       color: var(--fg-color, #ededed);
-      background: var(--comfy-menu-bg, #181818);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 8px;
-      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.48);
+      background: var(--comfy-menu-bg, var(--bg-color, #181818));
+      border-right: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.12));
+      border-radius: 0;
+      box-shadow: var(--shadow-interface, 0 12px 26px rgba(0, 0, 0, 0.32));
       overflow: hidden;
       font-family: var(--font-family, system-ui, sans-serif);
     }
@@ -585,31 +565,26 @@ function installMultiGpuMenu(originalFetchApi) {
   }
 
   function findSidebarHost() {
-    const knownLabels = new Set(["Assets", "Nodes", "Models", "Workflows", "Apps", "NodesMap", "Templates"]);
-    const textNodes = Array.from(document.querySelectorAll("button, a, div, span")).filter((element) =>
-      knownLabels.has((element.textContent || "").trim()),
+    return (
+      document.querySelector(".side-toolbar-container .sidebar-item-group") ||
+      document.querySelector('[data-testid="side-toolbar"] .sidebar-item-group')
     );
-    for (const element of textNodes) {
-      let current = element;
-      for (let depth = 0; current && depth < 6; depth += 1) {
-        const rect = current.getBoundingClientRect();
-        if (rect.width > 34 && rect.width <= 92 && rect.height > 220) {
-          return current;
-        }
-        current = current.parentElement;
-      }
-    }
-    return null;
+  }
+
+  function findToolbarContainer() {
+    return (
+      document.querySelector(".side-toolbar-container") ||
+      document.querySelector('[data-testid="side-toolbar"]')
+    );
   }
 
   function positionPanel() {
     if (!state.panel || !state.button) return;
-    const rect = state.button.getBoundingClientRect();
-    const panelWidth = Math.min(344, window.innerWidth - 72);
-    const left = Math.min(rect.right + 8, window.innerWidth - panelWidth - 8);
-    const top = Math.min(Math.max(rect.top - 12, 8), window.innerHeight - 180);
-    state.panel.style.left = `${Math.max(left, 56)}px`;
-    state.panel.style.top = `${top}px`;
+    const toolbar = findToolbarContainer();
+    const rect = toolbar?.getBoundingClientRect() || state.button.getBoundingClientRect();
+    const left = Math.max(Math.round(rect.right), 0);
+    state.panel.style.left = `${left}px`;
+    state.panel.style.width = `min(360px, calc(100vw - ${left}px))`;
   }
 
   function renderPanel() {
@@ -744,6 +719,7 @@ function installMultiGpuMenu(originalFetchApi) {
     state.panel?.remove();
     state.panel = null;
     state.button?.removeAttribute("data-open");
+    state.button?.setAttribute("aria-pressed", "false");
     if (state.refreshTimer) {
       clearInterval(state.refreshTimer);
       state.refreshTimer = 0;
@@ -757,29 +733,41 @@ function installMultiGpuMenu(originalFetchApi) {
     }
     state.panel = document.createElement("div");
     state.panel.id = "mgpu-menu-panel";
-    document.body.appendChild(state.panel);
+    (findToolbarContainer() || document.body).appendChild(state.panel);
     state.button?.setAttribute("data-open", "true");
+    state.button?.setAttribute("aria-pressed", "true");
     renderPanel();
     refreshStatus();
     state.refreshTimer = setInterval(refreshStatus, 5000);
   }
 
   function attachButton() {
-    if (state.button) return;
-    const button = document.createElement("button");
-    button.id = "mgpu-sidebar-button";
-    button.type = "button";
-    button.title = "MultiGPU";
-    button.innerHTML = `${gpuIconSvg()}<span>MultiGPU</span>`;
-    button.addEventListener("click", openPanel);
-    state.button = button;
-
     const sidebar = findSidebarHost();
-    if (sidebar) {
-      sidebar.appendChild(button);
-    } else {
-      button.classList.add("mgpu-sidebar-fixed");
-      document.body.appendChild(button);
+    if (!sidebar) return;
+
+    if (!state.button) {
+      const button = document.createElement("button");
+      button.id = "mgpu-sidebar-button";
+      button.type = "button";
+      button.title = "MultiGPU";
+      button.setAttribute("aria-label", "MultiGPU");
+      button.setAttribute("aria-pressed", "false");
+      button.className =
+        "relative inline-flex items-center justify-center gap-2 touch-manipulation whitespace-nowrap appearance-none font-medium font-inter transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg:not([width]):not([height])]:size-4 [&_svg]:shrink-0 bg-transparent text-muted-foreground hover:bg-secondary-background-hover h-8 rounded-lg p-2 text-xs side-bar-button cursor-pointer border-none mgpu-tab-button";
+      button.innerHTML = `
+        <div class="side-bar-button-content flex flex-col items-center gap-2">
+          <div class="sidebar-icon-wrapper relative">${gpuIconSvg().replace("<svg", '<svg class="side-bar-button-icon"')}</div>
+          <span class="side-bar-button-label text-center text-2xs">MultiGPU</span>
+        </div>
+      `;
+      button.addEventListener("click", openPanel);
+      state.button = button;
+    }
+
+    if (state.button.parentElement !== sidebar) {
+      const templatesButton = sidebar.querySelector(".templates-tab-button");
+      sidebar.insertBefore(state.button, templatesButton || null);
+      positionPanel();
     }
   }
 
@@ -787,10 +775,12 @@ function installMultiGpuMenu(originalFetchApi) {
   const attachObserver = new MutationObserver(() => attachButton());
   attachObserver.observe(document.body, { childList: true, subtree: true });
   window.addEventListener("resize", positionPanel);
-  document.addEventListener("pointerdown", (event) => {
+  document.addEventListener("click", (event) => {
     if (!state.panel) return;
-    if (state.panel.contains(event.target) || state.button?.contains(event.target)) return;
-    closePanel();
+    const sidebarButton = event.target.closest?.(".side-bar-button");
+    if (sidebarButton && sidebarButton !== state.button) {
+      closePanel();
+    }
   });
 }
 
