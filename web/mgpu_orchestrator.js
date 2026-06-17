@@ -341,6 +341,7 @@ function installMultiGpuMenu(originalFetchApi) {
     setTimeout(() => installMultiGpuMenu(originalFetchApi), 500);
     return;
   }
+  const iconUrl = new URL("./mgpu-icon.svg", import.meta.url).href;
 
   const state = {
     panel: null,
@@ -361,8 +362,8 @@ function installMultiGpuMenu(originalFetchApi) {
       width: var(--sidebar-icon-size, 1rem);
       height: var(--sidebar-icon-size, 1rem);
       background-color: currentColor;
-      -webkit-mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M4 7.5A2.5 2.5 0 0 1 6.5 5h8A2.5 2.5 0 0 1 17 7.5V8h1.75A1.25 1.25 0 0 1 20 9.25V11h1.25a.75.75 0 0 1 0 1.5H20v2.25A1.25 1.25 0 0 1 18.75 16H17v.5a2.5 2.5 0 0 1-2.5 2.5h-8A2.5 2.5 0 0 1 4 16.5V16H2.75a.75.75 0 0 1 0-1.5H4v-2H2.75a.75.75 0 0 1 0-1.5H4V9H2.75a.75.75 0 0 1 0-1.5H4Zm2.5-1A1 1 0 0 0 5.5 7.5v9a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-8Zm10.5 3V14.5h1.5V9.5H17Z'/%3E%3Cpath d='M8.25 9.25h4.5a.75.75 0 0 1 .75.75v4a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 7.5 14v-4a.75.75 0 0 1 .75-.75Zm.75 1.5v2.5h3v-2.5H9Z'/%3E%3C/svg%3E") center / contain no-repeat;
-      mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M4 7.5A2.5 2.5 0 0 1 6.5 5h8A2.5 2.5 0 0 1 17 7.5V8h1.75A1.25 1.25 0 0 1 20 9.25V11h1.25a.75.75 0 0 1 0 1.5H20v2.25A1.25 1.25 0 0 1 18.75 16H17v.5a2.5 2.5 0 0 1-2.5 2.5h-8A2.5 2.5 0 0 1 4 16.5V16H2.75a.75.75 0 0 1 0-1.5H4v-2H2.75a.75.75 0 0 1 0-1.5H4V9H2.75a.75.75 0 0 1 0-1.5H4Zm2.5-1A1 1 0 0 0 5.5 7.5v9a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-8Zm10.5 3V14.5h1.5V9.5H17Z'/%3E%3Cpath d='M8.25 9.25h4.5a.75.75 0 0 1 .75.75v4a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 7.5 14v-4a.75.75 0 0 1 .75-.75Zm.75 1.5v2.5h3v-2.5H9Z'/%3E%3C/svg%3E") center / contain no-repeat;
+      -webkit-mask: url("${iconUrl}") center / contain no-repeat;
+      mask: url("${iconUrl}") center / contain no-repeat;
     }
     .mgpu-extension-slot {
       min-height: 100%;
