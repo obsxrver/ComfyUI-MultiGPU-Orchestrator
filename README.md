@@ -1,6 +1,12 @@
+
 # ComfyUI Multi-GPU Orchestrator
 
 ## Use ALL the GPUs!
+
+<p align="center">
+  <img width="48%" alt="ComfyUI-MultiGPU-Example 1" src="https://github.com/user-attachments/assets/c8bb0720-e7d3-4014-85b4-8f46461fb582" />
+  <img width="48%" alt="ComfyUI-MultiGPU-Example 2" src="https://github.com/user-attachments/assets/dad6aa42-3ce2-48a0-a2e2-c8a2b9a2d4d9" />
+</p>
 
 Multi-GPU Orchestrator turns one ComfyUI session into a smart multi-GPU routing system. Perfect for cloud clusters (Vast.AI, Runpod) and CUDA-rich powerusers. Unlock maximum resource utilization by dispatching workflows across every GPU on your system. All you have to do is click the "► Run" button.  
 
@@ -26,9 +32,6 @@ Clone this repository into `ComfyUI/custom_nodes/`:
 cd ComfyUI/custom_nodes
 git clone https://github.com/obsxrver/ComfyUI-MultiGPU-Orchestrator.git
 ```
-
-
-<img width="2546" height="990" alt="Screenshot 2026-06-17 183235" src="https://github.com/user-attachments/assets/f746b1cd-efdd-4e13-90c8-a3ad24b58daf" />
 
 
 
