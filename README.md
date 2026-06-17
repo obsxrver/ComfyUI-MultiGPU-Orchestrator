@@ -13,7 +13,7 @@ Clone or copy this repository into `ComfyUI/custom_nodes/`:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <this-repo-url> ComfyUI-MultiGPU-Orchestrator
+git clone https://github.com/obsxrver/ComfyUI-MultiGPU-Orchestrator
 ```
 
 Then start ComfyUI normally. The primary process becomes the UI/orchestrator and
