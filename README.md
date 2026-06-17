@@ -1,14 +1,8 @@
 # ComfyUI Multi-GPU Orchestrator
 
-Use every GPU on your remote ComfyUI box without changing how you work.
+## Use ALL the GPUs!
 
-This custom node turns one ComfyUI session into a multi-GPU launcher. Keep using
-the normal Queue button, job queue, history, previews, videos, images, and media
-assets tab. Behind the scenes, the orchestrator starts one private worker per
-CUDA GPU and sends each generation to the least-busy worker.
-
-It is built for cloud GPU hosts like Vast.AI, where you usually want one public
-ComfyUI port and zero fiddling with a separate browser tab for every GPU.
+Multi-GPU Orchestrator turns one ComfyUI session into a smart multi-GPU routing system. Perfect for cloud clusters (Vast.AI, Runpod) and CUDA-rich powerusers, Orchestrator unlocks maximum resource utilization by running your workflows accross every GPU on your system. All you have to do is click the "► Run" button.  
 
 ## Why Use It
 
