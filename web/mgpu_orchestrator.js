@@ -5,6 +5,8 @@ const EXTENSION_NAME = "comfyui.mgpu.orchestrator";
 const FALLBACK_STATUSES = new Set([404, 424, 503]);
 let warnedFallback = false;
 let bypassDirectFetchRewrite = false;
+const rowProgressByPrompt = new Map();
+let rowProgressFrame = 0;
 
 function normalizeRoute(route) {
   return String(route || "");
@@ -149,6 +151,169 @@ function warnFallback(message) {
   }
 }
 
+function clampPercent(value) {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) return 0;
+  return Math.min(Math.max(Math.round(numberValue), 0), 100);
+}
+
+function formatPercent(value) {
+  return `${clampPercent(value)}%`;
+}
+
+function summarizeProgressState(data) {
+  const promptId = data?.prompt_id;
+  if (!promptId) return null;
+
+  const mgpu = data.mgpu || {};
+  const nodes = Object.values(data.nodes || {}).filter(
+    (node) => node && typeof node === "object",
+  );
+  const runningNode = nodes.find((node) => node.state === "running");
+  const finishedCount = nodes.filter((node) => node.state === "finished").length;
+  const currentValue = Number(runningNode?.value || 0);
+  const currentMax = Number(runningNode?.max || 0);
+  const currentRatio = currentMax > 0 ? currentValue / currentMax : 0;
+  const totalNodes = Number(mgpu.total_nodes || nodes.length || 1);
+  const totalPercent =
+    mgpu.total_percent ?? ((finishedCount + currentRatio) / totalNodes) * 100;
+
+  return {
+    promptId: String(promptId),
+    totalPercent: clampPercent(totalPercent),
+    currentNodePercent: clampPercent(mgpu.current_node_percent ?? currentRatio * 100),
+    currentNodeLabel:
+      mgpu.current_node_label ||
+      runningNode?.node_label ||
+      runningNode?.node_type ||
+      runningNode?.real_node_id ||
+      runningNode?.node_id ||
+      "",
+  };
+}
+
+function ensureSecondaryText(row, textColumn) {
+  let wrapper = row.querySelector("[data-mgpu-secondary]");
+  if (!wrapper) {
+    wrapper = document.createElement("div");
+    wrapper.dataset.mgpuSecondary = "true";
+    wrapper.className = "min-w-0 text-xs leading-none text-text-secondary";
+    const span = document.createElement("span");
+    span.className = "block truncate";
+    wrapper.appendChild(span);
+    textColumn.appendChild(wrapper);
+  }
+  return wrapper.querySelector("span");
+}
+
+function ensureProgressBars(row) {
+  const item = row.firstElementChild;
+  if (!item) return null;
+  let bar = item.querySelector(":scope > .mgpu-row-progress");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.className = "mgpu-row-progress";
+    bar.innerHTML = '<div data-mgpu-total></div><div data-mgpu-current></div>';
+    item.insertBefore(bar, item.firstChild);
+  }
+  return bar;
+}
+
+function clearInjectedRowProgress(row) {
+  row.querySelector(".mgpu-row-progress")?.remove();
+  row.querySelector("[data-mgpu-secondary]")?.remove();
+}
+
+function updateQueueProgressRowsNow() {
+  rowProgressFrame = 0;
+  document.querySelectorAll("[data-job-id]").forEach((row) => {
+    const progress = rowProgressByPrompt.get(String(row.dataset.jobId || ""));
+    if (!progress) {
+      clearInjectedRowProgress(row);
+      return;
+    }
+
+    const spans = row.querySelectorAll("span.block.truncate");
+    const primary = spans[0];
+    const textColumn = primary?.closest(".flex-col");
+    if (!primary || !textColumn) return;
+
+    const secondary = spans[1] || ensureSecondaryText(row, textColumn);
+    const primaryText = `Total: ${formatPercent(progress.totalPercent)}`;
+    const secondaryText = progress.currentNodeLabel
+      ? `${progress.currentNodeLabel}: ${formatPercent(progress.currentNodePercent)}`
+      : "";
+
+    primary.textContent = primaryText;
+    primary.title = primaryText;
+    if (secondary) {
+      secondary.textContent = secondaryText;
+      secondary.title = secondaryText;
+    }
+
+    const bar = ensureProgressBars(row);
+    if (bar) {
+      const total = bar.querySelector("[data-mgpu-total]");
+      const current = bar.querySelector("[data-mgpu-current]");
+      if (total) total.style.width = `${progress.totalPercent}%`;
+      if (current) current.style.width = `${progress.currentNodePercent}%`;
+    }
+  });
+}
+
+function scheduleQueueProgressRowsUpdate() {
+  if (rowProgressFrame) return;
+  rowProgressFrame = requestAnimationFrame(updateQueueProgressRowsNow);
+}
+
+function installQueueProgressRowPatch() {
+  if (api.__mgpuQueueProgressRowsPatched) return;
+  api.__mgpuQueueProgressRowsPatched = true;
+
+  const style = document.createElement("style");
+  style.textContent = `
+    .mgpu-row-progress {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      overflow: hidden;
+      border-radius: inherit;
+      pointer-events: none;
+    }
+    .mgpu-row-progress > div {
+      position: absolute;
+      inset-block: 0;
+      left: 0;
+      transition: width 160ms ease;
+    }
+    .mgpu-row-progress > [data-mgpu-total] {
+      background: var(--color-interface-panel-job-progress-primary, rgba(21, 101, 192, 0.75));
+    }
+    .mgpu-row-progress > [data-mgpu-current] {
+      background: var(--color-interface-panel-job-progress-secondary, rgba(30, 136, 229, 0.45));
+    }
+  `;
+  document.head.appendChild(style);
+
+  api.addEventListener("progress_state", (event) => {
+    const progress = summarizeProgressState(event.detail);
+    if (!progress) return;
+    rowProgressByPrompt.set(progress.promptId, progress);
+    scheduleQueueProgressRowsUpdate();
+  });
+
+  for (const eventName of ["execution_success", "execution_error", "execution_interrupted"]) {
+    api.addEventListener(eventName, (event) => {
+      const promptId = event.detail?.prompt_id;
+      if (promptId) rowProgressByPrompt.delete(String(promptId));
+      scheduleQueueProgressRowsUpdate();
+    });
+  }
+
+  const observer = new MutationObserver(scheduleQueueProgressRowsUpdate);
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
 async function fetchWithFallback(originalFetchApi, originalRoute, mgpuRoute, options) {
   try {
     const response = await originalFetchApi.call(api, mgpuRoute, options);
@@ -208,6 +373,7 @@ app.registerExtension({
     };
 
     api.__mgpuOrchestratorWrapped = true;
+    installQueueProgressRowPatch();
 
     originalFetchApi("/mgpu/status")
       .then(async (response) => {

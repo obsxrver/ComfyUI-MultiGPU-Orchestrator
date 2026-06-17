@@ -189,6 +189,19 @@ def parse_offset(value: str | None) -> int:
     return max(parsed, 0)
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_ratio(value: float, max_value: float) -> float:
+    if max_value <= 0:
+        return 0.0
+    return min(max(value / max_value, 0.0), 1.0)
+
+
 def query_to_dict(query: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key in query.keys():
@@ -483,6 +496,8 @@ class MultiGpuOrchestrator:
         self.workers: list[WorkerState] = []
         self.prompt_to_worker: dict[str, WorkerState] = {}
         self.asset_to_worker: dict[str, WorkerState] = {}
+        self.prompt_metadata: dict[str, dict[str, Any]] = {}
+        self.prompt_progress: dict[str, dict[str, Any]] = {}
         self._session: aiohttp.ClientSession | None = None
         self._rr_index = 0
         self._started = False
@@ -658,7 +673,7 @@ class MultiGpuOrchestrator:
                 if response.status < 500:
                     body = await response.read()
                     if response.status == 200:
-                        self._remember_prompt_worker(worker, body)
+                        self._remember_prompt_worker(worker, body, json_data.get("prompt"))
                         await self.refresh_worker_queue(worker)
                         if client_id:
                             await self._send_aggregate_status(str(client_id))
@@ -707,7 +722,12 @@ class MultiGpuOrchestrator:
             headers={"Comfy-Usage-Source": "comfyui-mgpu-orchestrator"},
         )
 
-    def _remember_prompt_worker(self, worker: WorkerState, body: bytes) -> None:
+    def _remember_prompt_worker(
+        self,
+        worker: WorkerState,
+        body: bytes,
+        prompt: dict[str, Any] | None = None,
+    ) -> None:
         try:
             data = json.loads(body.decode("utf-8"))
             prompt_id = data.get("prompt_id")
@@ -717,6 +737,29 @@ class MultiGpuOrchestrator:
             prompt_id = str(prompt_id)
             worker.accepted_prompt_ids.add(prompt_id)
             self.prompt_to_worker[prompt_id] = worker
+            if isinstance(prompt, dict):
+                self.prompt_metadata[prompt_id] = self._build_prompt_metadata(prompt)
+
+    @staticmethod
+    def _build_prompt_metadata(prompt: dict[str, Any]) -> dict[str, Any]:
+        node_labels: dict[str, str] = {}
+        node_types: dict[str, str] = {}
+        for node_id, node in prompt.items():
+            if not isinstance(node, dict):
+                continue
+            node_key = str(node_id)
+            node_type = str(node.get("class_type") or "")
+            meta = node.get("_meta")
+            title = meta.get("title") if isinstance(meta, dict) else None
+            label = str(title or node_type or node_key)
+            node_labels[node_key] = label
+            if node_type:
+                node_types[node_key] = node_type
+        return {
+            "node_labels": node_labels,
+            "node_types": node_types,
+            "total_nodes": len(node_labels),
+        }
 
     @staticmethod
     def _copy_response_headers(response: aiohttp.ClientResponse) -> dict[str, str]:
@@ -771,6 +814,7 @@ class MultiGpuOrchestrator:
         try:
             async with self._session.ws_connect(ws_url, heartbeat=30) as ws:
                 ready.set()
+                await self._send_client_feature_flags_to_worker(ws, client_id)
                 async for message in ws:
                     if message.type == aiohttp.WSMsgType.TEXT:
                         await self._forward_ws_text(worker, client_id, message.data)
@@ -790,6 +834,19 @@ class MultiGpuOrchestrator:
                 exc,
             )
 
+    async def _send_client_feature_flags_to_worker(self, ws: Any, client_id: str) -> None:
+        metadata = getattr(self.prompt_server, "sockets_metadata", {}).get(client_id, {})
+        feature_flags = metadata.get("feature_flags") if isinstance(metadata, dict) else None
+        if not isinstance(feature_flags, dict):
+            feature_flags = {
+                "supports_preview_metadata": True,
+                "supports_progress_text_metadata": True,
+            }
+        try:
+            await ws.send_json({"type": "feature_flags", "data": feature_flags})
+        except Exception as exc:
+            logging.debug("%s Failed to forward websocket feature flags: %s", LOG_PREFIX, exc)
+
     async def _forward_ws_text(self, worker: WorkerState, client_id: str, raw: str) -> None:
         try:
             message = json.loads(raw)
@@ -803,6 +860,8 @@ class MultiGpuOrchestrator:
         if message_type not in FORWARDED_WS_TYPES:
             return
         data = message.get("data")
+        if message_type == "progress_state":
+            data = self._enrich_progress_state(worker, data)
         if message_type == "execution_start":
             worker.running = max(worker.running, 1)
             worker.last_seen = time.time()
@@ -814,6 +873,86 @@ class MultiGpuOrchestrator:
         elif message_type in {"execution_error", "execution_interrupted"}:
             await self.refresh_worker_queue(worker)
             await self._send_aggregate_status(client_id)
+
+    def _enrich_progress_state(self, worker: WorkerState, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        prompt_id = self._progress_prompt_id(worker, data)
+        if not prompt_id:
+            return data
+
+        nodes = data.get("nodes")
+        if not isinstance(nodes, dict):
+            return data
+
+        metadata = self.prompt_metadata.get(prompt_id, {})
+        labels = metadata.get("node_labels") if isinstance(metadata, dict) else {}
+        types = metadata.get("node_types") if isinstance(metadata, dict) else {}
+        if not isinstance(labels, dict):
+            labels = {}
+        if not isinstance(types, dict):
+            types = {}
+
+        enriched_nodes: dict[str, Any] = {}
+        running_node: dict[str, Any] | None = None
+        finished_count = 0
+        running_progress = 0.0
+        for node_id, state in nodes.items():
+            if not isinstance(state, dict):
+                enriched_nodes[str(node_id)] = state
+                continue
+            node_key = str(state.get("real_node_id") or state.get("node_id") or node_id)
+            node_state = str(state.get("state") or "")
+            value = _safe_float(state.get("value"), 0.0)
+            max_value = _safe_float(state.get("max"), 0.0)
+            ratio = _bounded_ratio(value, max_value)
+            enriched = {
+                **state,
+                "node_label": labels.get(node_key) or labels.get(str(node_id)) or node_key,
+                "node_type": types.get(node_key) or types.get(str(node_id)),
+            }
+            enriched_nodes[str(node_id)] = {key: value for key, value in enriched.items() if value is not None}
+            if node_state == "finished":
+                finished_count += 1
+            elif node_state == "running" and running_node is None:
+                running_node = enriched_nodes[str(node_id)]
+                running_progress = ratio
+
+        total_nodes = int(metadata.get("total_nodes") or len(enriched_nodes) or 1)
+        total_ratio = _bounded_ratio(finished_count + running_progress, total_nodes)
+        current_ratio = _bounded_ratio(
+            _safe_float(running_node.get("value"), 0.0) if running_node else 0.0,
+            _safe_float(running_node.get("max"), 0.0) if running_node else 0.0,
+        )
+        mgpu = {
+            "total_percent": round(total_ratio * 100),
+            "current_node_percent": round(current_ratio * 100),
+            "current_node_label": running_node.get("node_label") if running_node else None,
+            "total_nodes": total_nodes,
+            "finished_nodes": finished_count,
+        }
+        enriched_data = {
+            **data,
+            "prompt_id": prompt_id,
+            "nodes": enriched_nodes,
+            "mgpu": {key: value for key, value in mgpu.items() if value is not None},
+        }
+        self.prompt_progress[prompt_id] = enriched_data
+        return enriched_data
+
+    @staticmethod
+    def _progress_prompt_id(worker: WorkerState, data: dict[str, Any]) -> str | None:
+        prompt_id = data.get("prompt_id")
+        if prompt_id:
+            return str(prompt_id)
+        nodes = data.get("nodes")
+        if isinstance(nodes, dict):
+            for state in nodes.values():
+                if isinstance(state, dict) and state.get("prompt_id"):
+                    return str(state["prompt_id"])
+        if len(worker.accepted_prompt_ids) == 1:
+            return next(iter(worker.accepted_prompt_ids))
+        return None
 
     async def _forward_ws_binary(self, client_id: str, raw: bytes) -> None:
         socket_obj = getattr(self.prompt_server, "sockets", {}).get(client_id)

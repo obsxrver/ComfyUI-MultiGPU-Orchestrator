@@ -295,6 +295,39 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
             ("status", {"status": build_queue_info([worker])}, "client-a"),
         )
 
+    async def test_progress_state_is_enriched_for_job_queue_rows(self):
+        prompt_server = FakePromptServer()
+        orchestrator = MultiGpuOrchestrator(prompt_server=prompt_server)
+        worker = WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000", status="healthy")
+        orchestrator.workers = [worker]
+        orchestrator._remember_prompt_worker(
+            worker,
+            b'{"prompt_id":"prompt-a"}',
+            {
+                "1": {"class_type": "LoadCheckpoint", "_meta": {"title": "Load Model"}},
+                "2": {"class_type": "KSampler", "_meta": {"title": "KSampler (Advanced)"}},
+            },
+        )
+
+        await orchestrator._forward_ws_text(
+            worker,
+            "client-a",
+            (
+                '{"type":"progress_state","data":{"prompt_id":"prompt-a","nodes":{'
+                '"1":{"state":"finished","value":1,"max":1,"node_id":"1","real_node_id":"1"},'
+                '"2":{"state":"running","value":5,"max":10,"node_id":"2","real_node_id":"2"}'
+                "}}}"
+            ),
+        )
+
+        message_type, data, client_id = prompt_server.sent[-1]
+        self.assertEqual(message_type, "progress_state")
+        self.assertEqual(client_id, "client-a")
+        self.assertEqual(data["mgpu"]["total_percent"], 75)
+        self.assertEqual(data["mgpu"]["current_node_percent"], 50)
+        self.assertEqual(data["mgpu"]["current_node_label"], "KSampler (Advanced)")
+        self.assertEqual(data["nodes"]["2"]["node_label"], "KSampler (Advanced)")
+
     async def test_request_worker_response_preserves_method(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
         session = FakeSession()
