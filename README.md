@@ -18,7 +18,7 @@ ComfyUI port and zero fiddling with a separate browser tab for every GPU.
 - Jobs are spread across healthy GPUs automatically.
 - Outputs, previews, save-image nodes, save-video nodes, history, and media
   assets stay available from the primary UI.
-- Works well with port mappings like `18188:8188` on remote GPU providers.
+- Works well with cloud providers out of the box.
 
 ## How It Works
 
