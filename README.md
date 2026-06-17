@@ -1,67 +1,91 @@
 # ComfyUI Multi-GPU Orchestrator
 
-Custom ComfyUI extension that keeps the native Queue/Run UX while routing prompt
-execution to one localhost-only ComfyUI worker per CUDA GPU.
+Use every GPU on your remote ComfyUI box without changing how you work.
 
-The intended cloud setup is to expose only the primary ComfyUI port, for example
-`18188:8188` on Vast.AI. Worker ports are chosen automatically and bind to
-`127.0.0.1`.
+This custom node turns one ComfyUI session into a multi-GPU launcher. Keep using
+the normal Queue button, job queue, history, previews, videos, images, and media
+assets tab. Behind the scenes, the orchestrator starts one private worker per
+CUDA GPU and sends each generation to the least-busy worker.
+
+It is built for cloud GPU hosts like Vast.AI, where you usually want one public
+ComfyUI port and zero fiddling with a separate browser tab for every GPU.
+
+## Why Use It
+
+- One ComfyUI UI controls all visible CUDA GPUs.
+- No workflow changes: press Queue like usual.
+- No public worker ports: backend workers bind to `127.0.0.1`.
+- Jobs are spread across healthy GPUs automatically.
+- Outputs, previews, save-image nodes, save-video nodes, history, and media
+  assets stay available from the primary UI.
+- Works well with port mappings like `18188:8188` on remote GPU providers.
+
+## How It Works
+
+When ComfyUI starts, the extension discovers the visible CUDA devices and starts
+one local worker per GPU. The main ComfyUI process stays as your browser-facing
+UI and orchestrator. Worker processes do the generation work.
+
+The normal ComfyUI frontend is patched so queueing, status polling, job/history
+reads, media asset reads, and refresh actions use the orchestrator automatically.
+If workers are unavailable, the UI falls back to native ComfyUI behavior.
 
 ## Install
 
-Clone or copy this repository into `ComfyUI/custom_nodes/`:
+Clone this repository into `ComfyUI/custom_nodes/`:
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/obsxrver/ComfyUI-MultiGPU-Orchestrator
 ```
 
-Then start ComfyUI normally. The primary process becomes the UI/orchestrator and
-spawns one worker per visible CUDA device.
+Then start ComfyUI normally.
 
-## Behavior
+Open:
 
-- Browser POST `/prompt` calls are rerouted to `/mgpu/prompt`.
-- Browser GET `/prompt` queue-status polling is rerouted to `/mgpu/prompt`.
-- Same-origin direct `fetch("/api/...")` calls for jobs, queue, history, assets,
-  tags, and prompt status are also rewritten to their `/mgpu/*` equivalents.
-- Asset detail/content/hash probe reads, including `HEAD /assets/...`, are
-  proxied to workers when needed.
-- Workers are launched with `--cuda-device <gpu>` and
-  `COMFYUI_MGPU_WORKER=1`.
-- The orchestrator chooses the healthy worker with the smallest running/pending
-  queue, tie-breaking round-robin.
-- Worker WebSocket execution events are forwarded to the primary browser client.
-- `/interrupt` and `/free` are fanned out to workers by the frontend wrapper.
-- The frontend Jobs API reads are routed through `/mgpu/jobs`, so running,
-  pending, and completed worker jobs can appear in the primary job queue/history.
-- If a worker does not expose ComfyUI's native Jobs API, `/mgpu/jobs` falls back
-  to synthesized entries from that worker's `/queue` and `/history` endpoints.
-- Queue/history clear and delete requests are routed to workers as well, so the
-  primary UI controls operate on the visible worker-backed lists.
-- Read-only asset list/detail/content requests are routed through `/mgpu/assets`
-  when available, and the primary output asset seeder is kicked after worker
-  completion to help the media assets tab discover shared-output files.
-- Asset tag reads are routed through `/mgpu/tags` so media tab filters can see
-  tags from worker asset indexes.
-- Asset seed refresh requests are routed to workers for output rescans, and also
-  trigger the primary output seeder.
+```text
+http://YOUR_HOST:18188
+```
+
+or whichever host/port you normally use for ComfyUI.
+
+## Check Worker Status
+
+After startup, visit:
+
+```text
+/mgpu/status
+```
+
+You should see one worker per visible CUDA GPU, each with a port, GPU index, and
+health state.
+
+Useful debug endpoints:
+
+```text
+/mgpu/jobs
+/mgpu/queue
+/mgpu/history
+/mgpu/assets
+/mgpu/tags
+```
 
 ## Configuration
 
-Environment variables:
+Most users do not need any configuration.
 
-- `COMFYUI_MGPU_DISABLED=1`: disable orchestration.
-- `COMFYUI_MGPU_WORKER=1`: worker mode; set automatically for child workers.
-- `COMFYUI_MGPU_DEVICES=0,1`: override discovered CUDA device indexes.
-- `COMFYUI_MGPU_STARTUP_TIMEOUT=120`: worker health-check timeout in seconds.
-- `COMFYUI_MGPU_WORKER_FLAGS="..."`: append extra flags to each worker command.
+Optional environment variables:
 
-Visit `/mgpu/status` on the primary ComfyUI server to inspect workers.
-Useful read proxies for debugging are `/mgpu/jobs`, `/mgpu/queue`,
-`/mgpu/history`, `/mgpu/assets`, and `/mgpu/tags`.
+- `COMFYUI_MGPU_DISABLED=1`: disable the orchestrator.
+- `COMFYUI_MGPU_DEVICES=0,1`: choose which CUDA device indexes to use.
+- `COMFYUI_MGPU_STARTUP_TIMEOUT=120`: worker startup timeout in seconds.
+- `COMFYUI_MGPU_WORKER_FLAGS="..."`: append extra flags to every worker.
+
+`COMFYUI_MGPU_WORKER=1` is set automatically for child workers. You normally
+should not set it yourself.
 
 ## Notes
 
-This extension assumes a CUDA/NVIDIA runtime. If no workers are available, the
-frontend wrapper falls back to native ComfyUI `/prompt` and logs a warning.
+This extension targets NVIDIA/CUDA ComfyUI installs. Worker ports are local-only
+by design, so you only need to expose your normal ComfyUI port to the outside
+world.
