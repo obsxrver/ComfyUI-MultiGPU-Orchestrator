@@ -333,11 +333,17 @@ function escapeHtml(value) {
 }
 
 function installMultiGpuMenu(originalFetchApi) {
-  if (document.getElementById("mgpu-sidebar-button")) return;
+  if (api.__mgpuSidebarTabRegistered) return;
+  api.__mgpuSidebarTabRegistered = true;
+  const manager = app?.extensionManager;
+  if (!manager?.registerSidebarTab) {
+    api.__mgpuSidebarTabRegistered = false;
+    setTimeout(() => installMultiGpuMenu(originalFetchApi), 500);
+    return;
+  }
 
   const state = {
     panel: null,
-    button: null,
     refreshTimer: 0,
     loading: false,
     actionKey: "",
@@ -346,34 +352,27 @@ function installMultiGpuMenu(originalFetchApi) {
     autoStart: true,
   };
 
-  const style = document.createElement("style");
-  style.textContent = `
-    #mgpu-sidebar-button {
-      width: 100%;
+  if (!document.getElementById("mgpu-sidebar-tab-style")) {
+    const style = document.createElement("style");
+    style.id = "mgpu-sidebar-tab-style";
+    style.textContent = `
+    .mgpu-gpu-icon {
+      display: inline-block;
+      width: var(--sidebar-icon-size, 1rem);
+      height: var(--sidebar-icon-size, 1rem);
+      background-color: currentColor;
+      -webkit-mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M4 7.5A2.5 2.5 0 0 1 6.5 5h8A2.5 2.5 0 0 1 17 7.5V8h1.75A1.25 1.25 0 0 1 20 9.25V11h1.25a.75.75 0 0 1 0 1.5H20v2.25A1.25 1.25 0 0 1 18.75 16H17v.5a2.5 2.5 0 0 1-2.5 2.5h-8A2.5 2.5 0 0 1 4 16.5V16H2.75a.75.75 0 0 1 0-1.5H4v-2H2.75a.75.75 0 0 1 0-1.5H4V9H2.75a.75.75 0 0 1 0-1.5H4Zm2.5-1A1 1 0 0 0 5.5 7.5v9a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-8Zm10.5 3V14.5h1.5V9.5H17Z'/%3E%3Cpath d='M8.25 9.25h4.5a.75.75 0 0 1 .75.75v4a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 7.5 14v-4a.75.75 0 0 1 .75-.75Zm.75 1.5v2.5h3v-2.5H9Z'/%3E%3C/svg%3E") center / contain no-repeat;
+      mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M4 7.5A2.5 2.5 0 0 1 6.5 5h8A2.5 2.5 0 0 1 17 7.5V8h1.75A1.25 1.25 0 0 1 20 9.25V11h1.25a.75.75 0 0 1 0 1.5H20v2.25A1.25 1.25 0 0 1 18.75 16H17v.5a2.5 2.5 0 0 1-2.5 2.5h-8A2.5 2.5 0 0 1 4 16.5V16H2.75a.75.75 0 0 1 0-1.5H4v-2H2.75a.75.75 0 0 1 0-1.5H4V9H2.75a.75.75 0 0 1 0-1.5H4Zm2.5-1A1 1 0 0 0 5.5 7.5v9a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-8Zm10.5 3V14.5h1.5V9.5H17Z'/%3E%3Cpath d='M8.25 9.25h4.5a.75.75 0 0 1 .75.75v4a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 7.5 14v-4a.75.75 0 0 1 .75-.75Zm.75 1.5v2.5h3v-2.5H9Z'/%3E%3C/svg%3E") center / contain no-repeat;
     }
-    #mgpu-sidebar-button .side-bar-button-icon {
-      width: 1rem;
-      height: 1rem;
-      fill: currentColor;
-    }
-    #mgpu-sidebar-button[data-open="true"] {
-      background: var(--secondary-background-hover, rgba(255, 255, 255, 0.08));
-      color: var(--fg-color, currentColor);
+    .mgpu-extension-slot {
+      min-height: 100%;
     }
     #mgpu-menu-panel {
-      position: fixed;
-      z-index: 9998;
-      top: 0;
-      bottom: 0;
-      width: min(360px, calc(100vw - 58px));
+      min-height: 100%;
       display: flex;
       flex-direction: column;
       color: var(--fg-color, #ededed);
       background: var(--comfy-menu-bg, var(--bg-color, #181818));
-      border-right: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.12));
-      border-radius: 0;
-      box-shadow: var(--shadow-interface, 0 12px 26px rgba(0, 0, 0, 0.32));
-      overflow: hidden;
       font-family: var(--font-family, system-ui, sans-serif);
     }
     .mgpu-menu-header,
@@ -383,10 +382,11 @@ function installMultiGpuMenu(originalFetchApi) {
       justify-content: space-between;
       gap: 10px;
       padding: 12px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+      border-bottom: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.09));
     }
     .mgpu-menu-footer {
-      border-top: 1px solid rgba(255, 255, 255, 0.09);
+      margin-top: auto;
+      border-top: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.09));
       border-bottom: 0;
     }
     .mgpu-menu-title {
@@ -410,12 +410,12 @@ function installMultiGpuMenu(originalFetchApi) {
       justify-content: center;
       color: inherit;
       background: transparent;
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      border: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.12));
       border-radius: 6px;
       cursor: pointer;
     }
     .mgpu-icon-button:hover {
-      background: rgba(255, 255, 255, 0.08);
+      background: var(--interface-panel-hover-surface, rgba(255, 255, 255, 0.08));
     }
     .mgpu-menu-body {
       overflow: auto;
@@ -430,7 +430,7 @@ function installMultiGpuMenu(originalFetchApi) {
       border-radius: 6px;
     }
     .mgpu-worker-row + .mgpu-worker-row {
-      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      border-top: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.08));
     }
     .mgpu-worker-main {
       display: grid;
@@ -487,13 +487,13 @@ function installMultiGpuMenu(originalFetchApi) {
       padding: 0 10px;
       color: var(--fg-color, #f2f2f2);
       background: rgba(255, 255, 255, 0.08);
-      border: 1px solid rgba(255, 255, 255, 0.13);
+      border: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.13));
       border-radius: 6px;
       cursor: pointer;
       font-size: 12px;
     }
     .mgpu-worker-action:hover {
-      background: rgba(255, 255, 255, 0.13);
+      background: var(--interface-panel-hover-surface, rgba(255, 255, 255, 0.13));
     }
     .mgpu-worker-action:disabled,
     .mgpu-icon-button:disabled {
@@ -555,36 +555,14 @@ function installMultiGpuMenu(originalFetchApi) {
     .mgpu-switch input:checked + span::after {
       transform: translateX(16px);
     }
-  `;
-  document.head.appendChild(style);
+    `;
+    document.head.appendChild(style);
+  }
 
   function statusTone(status) {
     if (status === "healthy") return "healthy";
     if (status === "starting" || status === "new") return "starting";
     return "unhealthy";
-  }
-
-  function findSidebarHost() {
-    return (
-      document.querySelector(".side-toolbar-container .sidebar-item-group") ||
-      document.querySelector('[data-testid="side-toolbar"] .sidebar-item-group')
-    );
-  }
-
-  function findToolbarContainer() {
-    return (
-      document.querySelector(".side-toolbar-container") ||
-      document.querySelector('[data-testid="side-toolbar"]')
-    );
-  }
-
-  function positionPanel() {
-    if (!state.panel || !state.button) return;
-    const toolbar = findToolbarContainer();
-    const rect = toolbar?.getBoundingClientRect() || state.button.getBoundingClientRect();
-    const left = Math.max(Math.round(rect.right), 0);
-    state.panel.style.left = `${left}px`;
-    state.panel.style.width = `min(360px, calc(100vw - ${left}px))`;
   }
 
   function renderPanel() {
@@ -654,7 +632,6 @@ function installMultiGpuMenu(originalFetchApi) {
     state.panel.querySelectorAll("[data-mgpu-action]").forEach((button) => {
       button.addEventListener("click", () => runWorkerAction(button.dataset.gpuIndex, button.dataset.mgpuAction));
     });
-    positionPanel();
   }
 
   async function refreshStatus() {
@@ -715,73 +692,40 @@ function installMultiGpuMenu(originalFetchApi) {
     renderPanel();
   }
 
-  function closePanel() {
-    state.panel?.remove();
+  function destroyPanel() {
     state.panel = null;
-    state.button?.removeAttribute("data-open");
-    state.button?.setAttribute("aria-pressed", "false");
     if (state.refreshTimer) {
       clearInterval(state.refreshTimer);
       state.refreshTimer = 0;
     }
   }
 
-  function openPanel() {
-    if (state.panel) {
-      closePanel();
-      return;
-    }
-    state.panel = document.createElement("div");
-    state.panel.id = "mgpu-menu-panel";
-    (findToolbarContainer() || document.body).appendChild(state.panel);
-    state.button?.setAttribute("data-open", "true");
-    state.button?.setAttribute("aria-pressed", "true");
+  function mountPanel(container) {
+    destroyPanel();
+    container.classList.add("mgpu-extension-slot");
+    container.innerHTML = '<div id="mgpu-menu-panel"></div>';
+    state.panel = container.querySelector("#mgpu-menu-panel");
     renderPanel();
     refreshStatus();
     state.refreshTimer = setInterval(refreshStatus, 5000);
   }
 
-  function attachButton() {
-    const sidebar = findSidebarHost();
-    if (!sidebar) return;
-
-    if (!state.button) {
-      const button = document.createElement("button");
-      button.id = "mgpu-sidebar-button";
-      button.type = "button";
-      button.title = "MultiGPU";
-      button.setAttribute("aria-label", "MultiGPU");
-      button.setAttribute("aria-pressed", "false");
-      button.className =
-        "relative inline-flex items-center justify-center gap-2 touch-manipulation whitespace-nowrap appearance-none font-medium font-inter transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg:not([width]):not([height])]:size-4 [&_svg]:shrink-0 bg-transparent text-muted-foreground hover:bg-secondary-background-hover h-8 rounded-lg p-2 text-xs side-bar-button cursor-pointer border-none mgpu-tab-button";
-      button.innerHTML = `
-        <div class="side-bar-button-content flex flex-col items-center gap-2">
-          <div class="sidebar-icon-wrapper relative">${gpuIconSvg().replace("<svg", '<svg class="side-bar-button-icon"')}</div>
-          <span class="side-bar-button-label text-center text-2xs">MultiGPU</span>
-        </div>
-      `;
-      button.addEventListener("click", openPanel);
-      state.button = button;
-    }
-
-    if (state.button.parentElement !== sidebar) {
-      const templatesButton = sidebar.querySelector(".templates-tab-button");
-      sidebar.insertBefore(state.button, templatesButton || null);
-      positionPanel();
-    }
+  function registerOfficialSidebarTab() {
+    const existingTabs = manager.getSidebarTabs?.() || [];
+    if (existingTabs.some((tab) => tab?.id === "mgpu")) return;
+    manager.registerSidebarTab({
+      id: "mgpu",
+      icon: "mgpu-gpu-icon",
+      title: "MultiGPU",
+      label: "MultiGPU",
+      tooltip: "MultiGPU",
+      type: "custom",
+      render: mountPanel,
+      destroy: destroyPanel,
+    });
   }
 
-  attachButton();
-  const attachObserver = new MutationObserver(() => attachButton());
-  attachObserver.observe(document.body, { childList: true, subtree: true });
-  window.addEventListener("resize", positionPanel);
-  document.addEventListener("click", (event) => {
-    if (!state.panel) return;
-    const sidebarButton = event.target.closest?.(".side-bar-button");
-    if (sidebarButton && sidebarButton !== state.button) {
-      closePanel();
-    }
-  });
+  registerOfficialSidebarTab();
 }
 
 async function fetchWithFallback(originalFetchApi, originalRoute, mgpuRoute, options) {
