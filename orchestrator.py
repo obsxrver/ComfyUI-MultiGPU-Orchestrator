@@ -23,6 +23,8 @@ except Exception:  # pragma: no cover - ComfyUI provides aiohttp at runtime.
 
 LOG_PREFIX = "[ComfyUI-MGPU]"
 WORKER_ENV_FLAG = "COMFYUI_MGPU_WORKER"
+CONFIG_PATH_ENV = "COMFYUI_MGPU_CONFIG"
+CONFIG_FILE_NAME = "mgpu_config.json"
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_JOBS_FETCH_LIMIT = 1000
 FORWARDED_WS_TYPES = {
@@ -208,6 +210,38 @@ def query_to_dict(query: Any) -> dict[str, Any]:
         values = query.getall(key) if hasattr(query, "getall") else [query.get(key)]
         result[key] = values if len(values) > 1 else values[0]
     return result
+
+
+def config_path() -> Path:
+    configured = os.environ.get(CONFIG_PATH_ENV)
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().with_name(CONFIG_FILE_NAME)
+
+
+def load_config() -> dict[str, Any]:
+    path = config_path()
+    data: dict[str, Any] = {}
+    try:
+        if path.exists():
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+    except Exception:
+        logging.exception("%s Failed to read config from %s", LOG_PREFIX, path)
+    return {
+        "auto_start": bool(data.get("auto_start", True)),
+    }
+
+
+def save_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "auto_start": bool(config.get("auto_start", True)),
+    }
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(normalized, indent=2, sort_keys=True), encoding="utf-8")
+    return normalized
 
 
 def route_with_query(route: str, query: Any) -> str:
@@ -502,29 +536,41 @@ class MultiGpuOrchestrator:
         self._rr_index = 0
         self._started = False
         self._start_lock = asyncio.Lock()
+        self._comfy_args: Any = None
+        self.config = load_config()
+        self.auto_start = bool(self.config.get("auto_start", True))
         self.routing_policy = "least_busy"
         self.startup_timeout = float(
             os.environ.get("COMFYUI_MGPU_STARTUP_TIMEOUT", DEFAULT_STARTUP_TIMEOUT_SECONDS)
         )
         self.comfy_root = find_comfy_root()
 
+    @staticmethod
+    def _load_comfy_args() -> Any:
+        try:
+            from comfy.cli_args import args as comfy_args
+        except Exception:
+            return None
+        return comfy_args
+
+    async def _ensure_session(self) -> None:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=None)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+
     async def start(self) -> None:
         async with self._start_lock:
             if self._started:
                 return
             self._started = True
-            timeout = aiohttp.ClientTimeout(total=None)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            await self._ensure_session()
 
             devices = discover_cuda_devices()
             if not devices:
                 logging.warning("%s No CUDA devices found; UI will fall back to native /prompt", LOG_PREFIX)
                 return
 
-            try:
-                from comfy.cli_args import args as comfy_args
-            except Exception:
-                comfy_args = None
+            self._comfy_args = self._load_comfy_args()
 
             for gpu_index in devices:
                 port = find_free_port()
@@ -534,7 +580,7 @@ class MultiGpuOrchestrator:
                     url=f"http://127.0.0.1:{port}",
                 )
                 self.workers.append(worker)
-                self._spawn_worker(worker, comfy_args)
+                self._spawn_worker(worker, self._comfy_args)
 
             await asyncio.gather(*(self._wait_for_worker(worker) for worker in self.workers))
 
@@ -551,6 +597,83 @@ class MultiGpuOrchestrator:
         for worker in self.workers:
             if worker.process and worker.process.poll() is None:
                 worker.process.terminate()
+
+    def _worker_for_gpu(self, gpu_index: int) -> WorkerState | None:
+        for worker in self.workers:
+            if worker.gpu_index == gpu_index:
+                return worker
+        return None
+
+    def _forget_worker_runtime_state(self, worker: WorkerState) -> None:
+        for task in worker.client_bridge_tasks.values():
+            task.cancel()
+        worker.client_bridge_tasks.clear()
+        worker.client_bridge_ready.clear()
+        worker.accepted_prompt_ids.clear()
+        self.prompt_to_worker = {
+            prompt_id: mapped_worker
+            for prompt_id, mapped_worker in self.prompt_to_worker.items()
+            if mapped_worker is not worker
+        }
+        self.asset_to_worker = {
+            asset_id: mapped_worker
+            for asset_id, mapped_worker in self.asset_to_worker.items()
+            if mapped_worker is not worker
+        }
+
+    async def _terminate_worker_process(self, worker: WorkerState) -> None:
+        process = worker.process
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            deadline = time.monotonic() + 5
+            while process.poll() is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+            if process.poll() is None:
+                process.kill()
+        worker.process = None
+
+    async def stop_worker(self, gpu_index: int) -> WorkerState | None:
+        worker = self._worker_for_gpu(gpu_index)
+        if worker is None:
+            return None
+        self._forget_worker_runtime_state(worker)
+        await self._terminate_worker_process(worker)
+        worker.status = "stopped"
+        worker.error = None
+        worker.running = 0
+        worker.pending = 0
+        worker.last_seen = None
+        return worker
+
+    async def restart_worker(self, gpu_index: int) -> WorkerState | None:
+        worker = self._worker_for_gpu(gpu_index)
+        if worker is None:
+            return None
+        await self._ensure_session()
+        self._forget_worker_runtime_state(worker)
+        await self._terminate_worker_process(worker)
+        worker.port = find_free_port()
+        worker.url = f"http://127.0.0.1:{worker.port}"
+        worker.status = "new"
+        worker.error = None
+        worker.running = 0
+        worker.pending = 0
+        worker.last_seen = None
+        if self._comfy_args is None:
+            self._comfy_args = self._load_comfy_args()
+        self._spawn_worker(worker, self._comfy_args)
+        await self._wait_for_worker(worker)
+        return worker
+
+    def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        config = dict(self.config)
+        if "auto_start" in payload:
+            config["auto_start"] = bool(payload["auto_start"])
+        self.config = save_config(config)
+        self.auto_start = bool(self.config.get("auto_start", True))
+        return self.config
 
     def _spawn_worker(self, worker: WorkerState, comfy_args: Any) -> None:
         command = build_worker_command(
@@ -623,6 +746,10 @@ class MultiGpuOrchestrator:
             return await response.json()
 
     async def refresh_worker_queue(self, worker: WorkerState) -> None:
+        if worker.status == "stopped":
+            worker.running = 0
+            worker.pending = 0
+            return
         try:
             data = await self._fetch_worker_json(worker, "/queue")
             worker.running = len(data.get("queue_running", []))
@@ -709,8 +836,8 @@ class MultiGpuOrchestrator:
         )
 
     async def prompt_status_response(self) -> Any:
-        await self.start()
-        await self.refresh_queues()
+        if self._started:
+            await self.refresh_queues()
         return web.json_response(build_queue_info(self.workers))
 
     async def _post_worker(self, worker: WorkerState, route: str, payload: dict[str, Any]) -> aiohttp.ClientResponse:
@@ -980,7 +1107,8 @@ class MultiGpuOrchestrator:
         return web.json_response({"workers": result}, status=status)
 
     async def proxy_jobs(self, request: Any) -> Any:
-        await self.start()
+        if not self._started:
+            return web.json_response({"error": "workers are not started"}, status=424)
         query = request.rel_url.query
         requested_status = parse_status_filter(query.get("status"))
         workflow_id = query.get("workflow_id")
@@ -1025,7 +1153,8 @@ class MultiGpuOrchestrator:
         )
 
     async def proxy_job_detail(self, request: Any) -> Any:
-        await self.start()
+        if not self._started:
+            return web.json_response({"error": "workers are not started"}, status=424)
         prompt_id = request.match_info.get("prompt_id", "")
         preferred = self.prompt_to_worker.get(prompt_id)
         workers = [preferred] if preferred else []
@@ -1050,7 +1179,8 @@ class MultiGpuOrchestrator:
         return web.json_response({"error": "Job not found"}, status=404)
 
     async def proxy_assets(self, request: Any) -> Any:
-        await self.start()
+        if not self._started:
+            return web.json_response({"error": "workers are not started"}, status=424)
         query = request.rel_url.query
         limit = parse_positive_int(query.get("limit"), 200)
         offset = parse_offset(query.get("offset"))
@@ -1090,7 +1220,8 @@ class MultiGpuOrchestrator:
         )
 
     async def proxy_asset_tail(self, request: Any) -> Any:
-        await self.start()
+        if not self._started:
+            return web.json_response({"error": "workers are not started"}, status=424)
         tail = request.match_info.get("tail", "")
         if not tail:
             return await self.proxy_assets(request)
@@ -1144,7 +1275,8 @@ class MultiGpuOrchestrator:
         return web.json_response({"workers": result}, status=status)
 
     async def proxy_tags(self, request: Any) -> Any:
-        await self.start()
+        if not self._started:
+            return web.json_response({"error": "workers are not started"}, status=424)
         query = request.rel_url.query
         limit = parse_positive_int(query.get("limit"), None)
         offset = parse_offset(query.get("offset"))
@@ -1167,7 +1299,8 @@ class MultiGpuOrchestrator:
         )
 
     async def proxy_queue(self, _request: Any) -> Any:
-        await self.start()
+        if not self._started:
+            return web.json_response({"error": "workers are not started"}, status=424)
         payloads = await self._fetch_worker_payloads("/queue")
         running: list[Any] = []
         pending: list[Any] = []
@@ -1220,7 +1353,8 @@ class MultiGpuOrchestrator:
         return web.json_response({"workers": result}, status=status)
 
     async def proxy_history(self, request: Any) -> Any:
-        await self.start()
+        if not self._started:
+            return web.json_response({"error": "workers are not started"}, status=424)
         prompt_id = request.match_info.get("prompt_id")
         route = f"/history/{prompt_id}" if prompt_id else "/history"
         payloads = await self._fetch_worker_payloads(route, query_to_dict(request.rel_url.query))
@@ -1289,7 +1423,7 @@ class MultiGpuOrchestrator:
     ) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
         for worker in self.workers:
-            if worker.status == "failed":
+            if worker.status in {"failed", "stopped"}:
                 continue
             try:
                 payload = await self._fetch_worker_json_with_query(worker, route, query)
@@ -1327,16 +1461,25 @@ class MultiGpuOrchestrator:
             logging.debug("%s Primary asset seed trigger skipped", LOG_PREFIX, exc_info=True)
 
     async def status_response(self) -> Any:
-        await self.start()
-        await self.refresh_queues()
+        if self._started:
+            await self.refresh_queues()
         return web.json_response(
             {
                 "enabled": True,
+                "auto_start": self.auto_start,
+                "started": self._started,
                 "worker_mode": os.environ.get(WORKER_ENV_FLAG) == "1",
                 "routing_policy": self.routing_policy,
                 "workers": [worker.public_dict() for worker in self.workers],
             }
         )
+
+    async def settings_response(self) -> Any:
+        return web.json_response(self.config)
+
+    async def settings_update_response(self, request: Any) -> Any:
+        payload = await _read_json_or_empty(request)
+        return web.json_response(self.update_config(payload))
 
 
 async def _read_json_or_empty(request: Any) -> dict[str, Any]:
@@ -1372,6 +1515,36 @@ def register_routes() -> MultiGpuOrchestrator | None:
     @routes.get("/mgpu/status")
     async def mgpu_status(_request):
         return await orchestrator.status_response()
+
+    @routes.get("/mgpu/settings")
+    async def mgpu_settings(_request):
+        return await orchestrator.settings_response()
+
+    @routes.post("/mgpu/settings")
+    async def mgpu_settings_update(request):
+        return await orchestrator.settings_update_response(request)
+
+    @routes.post("/mgpu/workers/{gpu_index}/stop")
+    async def mgpu_worker_stop(request):
+        try:
+            gpu_index = int(request.match_info.get("gpu_index"))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid gpu index"}, status=400)
+        worker = await orchestrator.stop_worker(gpu_index)
+        if worker is None:
+            return web.json_response({"error": "worker not found"}, status=404)
+        return web.json_response({"worker": worker.public_dict()})
+
+    @routes.post("/mgpu/workers/{gpu_index}/restart")
+    async def mgpu_worker_restart(request):
+        try:
+            gpu_index = int(request.match_info.get("gpu_index"))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid gpu index"}, status=400)
+        worker = await orchestrator.restart_worker(gpu_index)
+        if worker is None:
+            return web.json_response({"error": "worker not found"}, status=404)
+        return web.json_response({"worker": worker.public_dict()})
 
     @routes.post("/mgpu/prompt")
     async def mgpu_prompt(request):
@@ -1437,7 +1610,10 @@ def register_routes() -> MultiGpuOrchestrator | None:
     async def mgpu_tags(request):
         return await orchestrator.proxy_tags(request)
 
-    prompt_server.loop.create_task(orchestrator.start())
+    if orchestrator.auto_start:
+        prompt_server.loop.create_task(orchestrator.start())
+        logging.info("%s Registered routes and scheduled worker startup", LOG_PREFIX)
+    else:
+        logging.info("%s Registered routes; worker startup is disabled", LOG_PREFIX)
     atexit.register(orchestrator.close_sync)
-    logging.info("%s Registered routes and scheduled worker startup", LOG_PREFIX)
     return orchestrator

@@ -1,4 +1,6 @@
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,8 +16,10 @@ from orchestrator import (  # noqa: E402
     aggregate_tags_payload,
     build_queue_info,
     build_worker_command,
+    load_config,
     parse_device_list,
     route_with_query,
+    save_config,
     synthesize_jobs_payload,
 )
 
@@ -223,6 +227,21 @@ class OrchestratorPureTests(unittest.TestCase):
         self.assertEqual(payload["mgpu"]["running"], 1)
         self.assertEqual(payload["mgpu"]["pending"], 2)
 
+    def test_config_defaults_auto_start_enabled_and_persists_toggle(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / "mgpu_config.json"
+            old_value = os.environ.get("COMFYUI_MGPU_CONFIG")
+            os.environ["COMFYUI_MGPU_CONFIG"] = str(config_file)
+            try:
+                self.assertEqual(load_config(), {"auto_start": True})
+                save_config({"auto_start": False})
+                self.assertEqual(load_config(), {"auto_start": False})
+            finally:
+                if old_value is None:
+                    os.environ.pop("COMFYUI_MGPU_CONFIG", None)
+                else:
+                    os.environ["COMFYUI_MGPU_CONFIG"] = old_value
+
 
 class FakePromptServer:
     def __init__(self):
@@ -338,6 +357,23 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(session.calls, [("HEAD", "http://127.0.0.1:9000/api/assets/hash/blake3:test")])
+
+    async def test_stop_worker_marks_worker_stopped_without_starting_others(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        worker = WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000", status="healthy")
+        worker.running = 1
+        worker.pending = 2
+        worker.accepted_prompt_ids.add("prompt-a")
+        orchestrator.workers = [worker]
+        orchestrator.prompt_to_worker["prompt-a"] = worker
+
+        stopped = await orchestrator.stop_worker(0)
+
+        self.assertIs(stopped, worker)
+        self.assertEqual(worker.status, "stopped")
+        self.assertEqual(worker.running, 0)
+        self.assertEqual(worker.pending, 0)
+        self.assertEqual(orchestrator.prompt_to_worker, {})
 
 
 if __name__ == "__main__":
