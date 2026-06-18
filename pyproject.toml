@@ -1,0 +1,18 @@
+[project]
+name = "multigpu-orchestrator"
+description = "Smart multi-GPU routing for ComfyUI."
+version = "1.0.0"
+license = "MIT" 
+
+
+
+[project.urls]
+Repository = "https://github.com/obsxrver/ComfyUI-MultiGPU-Orchestrator"
+
+[tool.comfy]
+PublisherId = "obsxrver"
+DisplayName = "ComfyUI-MultiGPU-Orchestrator"
+Icon = "https://raw.githubusercontent.com/obsxrver/ComfyUI-MultiGPU-Orchestrator/refs/heads/master/web/mgpu-icon.png"
+includes = [] 
+# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
+
