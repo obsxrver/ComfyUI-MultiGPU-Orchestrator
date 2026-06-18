@@ -314,15 +314,6 @@ function installQueueProgressRowPatch() {
   observer.observe(document.body, { childList: true, subtree: true });
 }
 
-function gpuIconSvg() {
-  return `
-    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <path d="M4 7.5A2.5 2.5 0 0 1 6.5 5h8A2.5 2.5 0 0 1 17 7.5V8h1.75A1.25 1.25 0 0 1 20 9.25V11h1.25a.75.75 0 0 1 0 1.5H20v2.25A1.25 1.25 0 0 1 18.75 16H17v.5a2.5 2.5 0 0 1-2.5 2.5h-8A2.5 2.5 0 0 1 4 16.5V16H2.75a.75.75 0 0 1 0-1.5H4v-2H2.75a.75.75 0 0 1 0-1.5H4V9H2.75a.75.75 0 0 1 0-1.5H4Zm2.5-1A1 1 0 0 0 5.5 7.5v9a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-8Zm10.5 3V14.5h1.5V9.5H17Z"/>
-      <path d="M8.25 9.25h4.5a.75.75 0 0 1 .75.75v4a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 7.5 14v-4a.75.75 0 0 1 .75-.75Zm.75 1.5v2.5h3v-2.5H9Z"/>
-    </svg>
-  `;
-}
-
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -398,10 +389,10 @@ function installMultiGpuMenu(originalFetchApi) {
       font-size: 14px;
       font-weight: 650;
     }
-    .mgpu-menu-title svg {
+    .mgpu-menu-title-icon {
       width: 19px;
       height: 19px;
-      fill: currentColor;
+      flex: 0 0 auto;
     }
     .mgpu-icon-button {
       width: 30px;
@@ -571,7 +562,10 @@ function installMultiGpuMenu(originalFetchApi) {
     const workers = Array.isArray(state.status?.workers) ? state.status.workers : [];
     state.panel.innerHTML = `
       <div class="mgpu-menu-header">
-        <div class="mgpu-menu-title">${gpuIconSvg()}<span>MultiGPU</span></div>
+        <div class="mgpu-menu-title">
+          <span class="mgpu-gpu-icon mgpu-menu-title-icon" aria-hidden="true"></span>
+          <span>MultiGPU</span>
+        </div>
         <button class="mgpu-icon-button" type="button" data-mgpu-refresh title="Refresh" ${state.loading ? "disabled" : ""}>&#8635;</button>
       </div>
       <div class="mgpu-menu-body"></div>
