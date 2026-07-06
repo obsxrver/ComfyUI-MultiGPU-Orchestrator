@@ -25,6 +25,7 @@ LOG_PREFIX = "[ComfyUI-MGPU]"
 WORKER_ENV_FLAG = "COMFYUI_MGPU_WORKER"
 CONFIG_PATH_ENV = "COMFYUI_MGPU_CONFIG"
 CONFIG_FILE_NAME = "mgpu_config.json"
+LOG_DIR_ENV = "COMFYUI_MGPU_LOG_DIR"
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_JOBS_FETCH_LIMIT = 1000
 FORWARDED_WS_TYPES = {
@@ -51,6 +52,7 @@ class WorkerState:
     running: int = 0
     pending: int = 0
     last_seen: float | None = None
+    log_path: str | None = None
     accepted_prompt_ids: set[str] = field(default_factory=set)
     client_bridge_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     client_bridge_ready: dict[str, asyncio.Event] = field(default_factory=dict)
@@ -75,6 +77,7 @@ class WorkerState:
             "load": self.load,
             "last_seen": self.last_seen,
             "pid": self.process.pid if self.process else None,
+            "log_path": self.log_path,
         }
 
 
@@ -103,6 +106,12 @@ def find_comfy_root() -> Path:
         if (candidate / "main.py").exists():
             return candidate
     return Path.cwd()
+
+
+def worker_log_path(comfy_root: Path, gpu_index: int, port: int) -> Path:
+    configured = os.environ.get(LOG_DIR_ENV)
+    log_dir = Path(configured) if configured else comfy_root / "logs" / "mgpu-workers"
+    return log_dir / f"gpu-{gpu_index}-port-{port}.log"
 
 
 def _optional_path_flag(command: list[str], flag: str, value: Any) -> None:
@@ -634,6 +643,24 @@ class MultiGpuOrchestrator:
                 process.kill()
         worker.process = None
 
+    def _update_exited_worker(self, worker: WorkerState) -> bool:
+        process = worker.process
+        if process is None or process.poll() is None:
+            return False
+        if worker.status not in {"failed", "stopped"}:
+            worker.status = "failed"
+            worker.error = f"worker exited with code {process.returncode}"
+            worker.running = 0
+            worker.pending = 0
+            logging.warning(
+                "%s Worker for GPU %s exited with code %s%s",
+                LOG_PREFIX,
+                worker.gpu_index,
+                process.returncode,
+                f"; see {worker.log_path}" if worker.log_path else "",
+            )
+        return True
+
     async def stop_worker(self, gpu_index: int) -> WorkerState | None:
         worker = self._worker_for_gpu(gpu_index)
         if worker is None:
@@ -684,26 +711,53 @@ class MultiGpuOrchestrator:
         )
         env = os.environ.copy()
         env[WORKER_ENV_FLAG] = "1"
+        log_file = None
+        stdout_target: Any = subprocess.DEVNULL
+        stderr_target: Any = subprocess.DEVNULL
         try:
+            try:
+                log_path = worker_log_path(self.comfy_root, worker.gpu_index, worker.port)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_file = log_path.open("a", encoding="utf-8")
+                worker.log_path = str(log_path)
+                log_file.write(
+                    f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting worker GPU {worker.gpu_index}: "
+                    f"{' '.join(command)}\n"
+                )
+                log_file.flush()
+                stdout_target = log_file
+                stderr_target = subprocess.STDOUT
+            except Exception:
+                worker.log_path = None
+                logging.warning(
+                    "%s Unable to open worker log for GPU %s; worker output will be discarded",
+                    LOG_PREFIX,
+                    worker.gpu_index,
+                    exc_info=True,
+                )
             worker.process = subprocess.Popen(
                 command,
                 cwd=str(self.comfy_root),
                 env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=stdout_target,
+                stderr=stderr_target,
             )
             worker.status = "starting"
             logging.info(
-                "%s Started worker for GPU %s on %s (pid=%s)",
+                "%s Started worker for GPU %s on %s (pid=%s, log=%s)",
                 LOG_PREFIX,
                 worker.gpu_index,
                 worker.url,
                 worker.process.pid,
+                worker.log_path,
             )
         except Exception as exc:
             worker.status = "failed"
             worker.error = str(exc)
             logging.exception("%s Failed to start worker for GPU %s", LOG_PREFIX, worker.gpu_index)
+        finally:
+            if log_file is not None:
+                log_file.close()
 
     async def _wait_for_worker(self, worker: WorkerState) -> None:
         deadline = time.monotonic() + self.startup_timeout
@@ -749,6 +803,8 @@ class MultiGpuOrchestrator:
         if worker.status == "stopped":
             worker.running = 0
             worker.pending = 0
+            return
+        if self._update_exited_worker(worker):
             return
         try:
             data = await self._fetch_worker_json(worker, "/queue")
