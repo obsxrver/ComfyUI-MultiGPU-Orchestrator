@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import copy
 import json
 import logging
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,8 +28,24 @@ WORKER_ENV_FLAG = "COMFYUI_MGPU_WORKER"
 CONFIG_PATH_ENV = "COMFYUI_MGPU_CONFIG"
 CONFIG_FILE_NAME = "mgpu_config.json"
 LOG_DIR_ENV = "COMFYUI_MGPU_LOG_DIR"
+WORKER_LOGS_TO_KEEP = 3
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_JOBS_FETCH_LIMIT = 1000
+ADDRESS_IN_USE_MARKERS = (
+    "address already in use",
+    "address is already in use",
+    "only one usage of each socket address",
+    "winerror 10048",
+    "errno 98",
+)
+CUDA_ERROR_MARKERS = (
+    "cuda error",
+    "cuda out of memory",
+    "cuda-capable device",
+    "no cuda gpus are available",
+    "cublas",
+    "cudnn",
+)
 FORWARDED_WS_TYPES = {
     "execution_start",
     "execution_cached",
@@ -54,8 +72,11 @@ class WorkerState:
     last_seen: float | None = None
     log_path: str | None = None
     accepted_prompt_ids: set[str] = field(default_factory=set)
+    pending_prompt_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_bridge_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     client_bridge_ready: dict[str, asyncio.Event] = field(default_factory=dict)
+    respawning: bool = False
+    respawn_blocked: bool = False
 
     @property
     def load(self) -> int:
@@ -78,6 +99,7 @@ class WorkerState:
             "last_seen": self.last_seen,
             "pid": self.process.pid if self.process else None,
             "log_path": self.log_path,
+            "tracked_pending": len(self.pending_prompt_payloads),
         }
 
 
@@ -108,10 +130,60 @@ def find_comfy_root() -> Path:
     return Path.cwd()
 
 
-def worker_log_path(comfy_root: Path, gpu_index: int, port: int) -> Path:
+def worker_log_dir(comfy_root: Path) -> Path:
     configured = os.environ.get(LOG_DIR_ENV)
-    log_dir = Path(configured) if configured else comfy_root / "logs" / "mgpu-workers"
-    return log_dir / f"gpu-{gpu_index}-port-{port}.log"
+    return Path(configured) if configured else comfy_root / "logs" / "mgpu-workers"
+
+
+def worker_log_path(comfy_root: Path, gpu_index: int, port: int, pid: int, timestamp: str | None = None) -> Path:
+    stamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
+    return worker_log_dir(comfy_root) / f"gpu-{gpu_index}-port-{port}-{stamp}-pid-{pid}.log"
+
+
+def prune_worker_logs(log_dir: Path, gpu_index: int, keep: int = WORKER_LOGS_TO_KEEP, current_log: Path | None = None) -> None:
+    if keep < 1:
+        keep = 1
+    try:
+        paths = [path for path in log_dir.glob(f"gpu-{gpu_index}-*.log") if path.is_file()]
+    except OSError:
+        logging.warning("%s Unable to list worker logs for GPU %s", LOG_PREFIX, gpu_index, exc_info=True)
+        return
+
+    def sort_key(path: Path) -> tuple[int, str]:
+        try:
+            return path.stat().st_mtime_ns, path.name
+        except OSError:
+            return 0, path.name
+
+    paths.sort(key=sort_key, reverse=True)
+    if current_log is not None:
+        current_log = current_log.resolve()
+        paths = sorted(paths, key=lambda path: path.resolve() == current_log, reverse=True)
+
+    for stale_path in paths[keep:]:
+        try:
+            stale_path.unlink()
+        except OSError:
+            logging.warning("%s Unable to delete old worker log %s", LOG_PREFIX, stale_path, exc_info=True)
+
+
+def _drain_worker_output(pipe: Any) -> None:
+    try:
+        with pipe:
+            for _ in pipe:
+                pass
+    except Exception:
+        logging.debug("%s Failed to drain worker output", LOG_PREFIX, exc_info=True)
+
+
+def _write_worker_output_to_log(pipe: Any, log_path: Path, header: str) -> None:
+    try:
+        with pipe, log_path.open("a", encoding="utf-8", errors="replace", buffering=1) as log_file:
+            log_file.write(header)
+            for line in pipe:
+                log_file.write(line)
+    except Exception:
+        logging.debug("%s Failed to write worker output to %s", LOG_PREFIX, log_path, exc_info=True)
 
 
 def _optional_path_flag(command: list[str], flag: str, value: Any) -> None:
@@ -240,12 +312,14 @@ def load_config() -> dict[str, Any]:
         logging.exception("%s Failed to read config from %s", LOG_PREFIX, path)
     return {
         "auto_start": bool(data.get("auto_start", True)),
+        "auto_respawn": bool(data.get("auto_respawn", True)),
     }
 
 
 def save_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = {
         "auto_start": bool(config.get("auto_start", True)),
+        "auto_respawn": bool(config.get("auto_respawn", True)),
     }
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -548,6 +622,7 @@ class MultiGpuOrchestrator:
         self._comfy_args: Any = None
         self.config = load_config()
         self.auto_start = bool(self.config.get("auto_start", True))
+        self.auto_respawn = bool(self.config.get("auto_respawn", True))
         self.routing_policy = "least_busy"
         self.startup_timeout = float(
             os.environ.get("COMFYUI_MGPU_STARTUP_TIMEOUT", DEFAULT_STARTUP_TIMEOUT_SECONDS)
@@ -619,6 +694,7 @@ class MultiGpuOrchestrator:
         worker.client_bridge_tasks.clear()
         worker.client_bridge_ready.clear()
         worker.accepted_prompt_ids.clear()
+        worker.pending_prompt_payloads.clear()
         self.prompt_to_worker = {
             prompt_id: mapped_worker
             for prompt_id, mapped_worker in self.prompt_to_worker.items()
@@ -643,7 +719,23 @@ class MultiGpuOrchestrator:
                 process.kill()
         worker.process = None
 
-    def _update_exited_worker(self, worker: WorkerState) -> bool:
+    def _worker_log_tail(self, worker: WorkerState, max_bytes: int = 32768) -> str:
+        if not worker.log_path:
+            return ""
+        try:
+            path = Path(worker.log_path)
+            with path.open("rb") as log_file:
+                if path.stat().st_size > max_bytes:
+                    log_file.seek(-max_bytes, os.SEEK_END)
+                return log_file.read().decode("utf-8", errors="replace").lower()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _has_marker(text: str, markers: tuple[str, ...]) -> bool:
+        return any(marker in text for marker in markers)
+
+    async def _handle_exited_worker(self, worker: WorkerState) -> bool:
         process = worker.process
         if process is None or process.poll() is None:
             return False
@@ -659,6 +751,8 @@ class MultiGpuOrchestrator:
                 process.returncode,
                 f"; see {worker.log_path}" if worker.log_path else "",
             )
+        if worker.status != "stopped" and self.auto_respawn and not worker.respawn_blocked:
+            await self._respawn_worker(worker)
         return True
 
     async def stop_worker(self, gpu_index: int) -> WorkerState | None:
@@ -672,6 +766,7 @@ class MultiGpuOrchestrator:
         worker.running = 0
         worker.pending = 0
         worker.last_seen = None
+        worker.respawn_blocked = False
         return worker
 
     async def restart_worker(self, gpu_index: int) -> WorkerState | None:
@@ -681,25 +776,85 @@ class MultiGpuOrchestrator:
         await self._ensure_session()
         self._forget_worker_runtime_state(worker)
         await self._terminate_worker_process(worker)
-        worker.port = find_free_port()
-        worker.url = f"http://127.0.0.1:{worker.port}"
-        worker.status = "new"
-        worker.error = None
-        worker.running = 0
-        worker.pending = 0
-        worker.last_seen = None
+        worker.respawn_blocked = False
         if self._comfy_args is None:
             self._comfy_args = self._load_comfy_args()
-        self._spawn_worker(worker, self._comfy_args)
-        await self._wait_for_worker(worker)
+        await self._start_worker_with_retry(worker, prefer_existing_port=False)
         return worker
+
+    async def _respawn_worker(self, worker: WorkerState) -> bool:
+        if worker.respawning or worker.status == "stopped":
+            return False
+        worker.respawning = True
+        pending_count = len(worker.pending_prompt_payloads)
+        logging.warning(
+            "%s Respawning worker for GPU %s with %s tracked pending job(s)",
+            LOG_PREFIX,
+            worker.gpu_index,
+            pending_count,
+        )
+        try:
+            await self._terminate_worker_process(worker)
+            if self._comfy_args is None:
+                self._comfy_args = self._load_comfy_args()
+            if not await self._start_worker_with_retry(worker, prefer_existing_port=True):
+                worker.respawn_blocked = True
+                return False
+            worker.respawn_blocked = False
+            if pending_count:
+                await self._requeue_worker_pending_prompts(worker)
+                await self.refresh_worker_queue(worker)
+            return True
+        finally:
+            worker.respawning = False
+
+    async def _start_worker_with_retry(self, worker: WorkerState, *, prefer_existing_port: bool) -> bool:
+        ports = [worker.port] if prefer_existing_port else []
+        ports.append(find_free_port())
+        seen_ports: set[int] = set()
+        for port in ports:
+            if port in seen_ports:
+                continue
+            seen_ports.add(port)
+            worker.port = port
+            worker.url = f"http://127.0.0.1:{worker.port}"
+            worker.status = "new"
+            worker.error = None
+            worker.running = 0
+            worker.pending = 0
+            worker.last_seen = None
+            self._spawn_worker(worker, self._comfy_args)
+            await self._wait_for_worker(worker)
+            if worker.healthy:
+                return True
+            tail = self._worker_log_tail(worker)
+            if self._has_marker(tail, CUDA_ERROR_MARKERS):
+                logging.error(
+                    "%s Worker for GPU %s failed with a CUDA error during restart; not retrying",
+                    LOG_PREFIX,
+                    worker.gpu_index,
+                )
+                return False
+            if not self._has_marker(tail, ADDRESS_IN_USE_MARKERS):
+                return False
+            logging.warning(
+                "%s Worker for GPU %s could not bind port %s; trying a different port",
+                LOG_PREFIX,
+                worker.gpu_index,
+                port,
+            )
+            await self._terminate_worker_process(worker)
+        return False
 
     def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         config = dict(self.config)
         if "auto_start" in payload:
             config["auto_start"] = bool(payload["auto_start"])
+        if "auto_respawn" in payload:
+            config["auto_respawn"] = bool(payload["auto_respawn"])
         self.config = save_config(config)
         self.auto_start = bool(self.config.get("auto_start", True))
+        self.auto_respawn = bool(self.config.get("auto_respawn", True))
         return self.config
 
     def _spawn_worker(self, worker: WorkerState, comfy_args: Any) -> None:
@@ -711,37 +866,47 @@ class MultiGpuOrchestrator:
         )
         env = os.environ.copy()
         env[WORKER_ENV_FLAG] = "1"
-        log_file = None
         stdout_target: Any = subprocess.DEVNULL
         stderr_target: Any = subprocess.DEVNULL
         try:
-            try:
-                log_path = worker_log_path(self.comfy_root, worker.gpu_index, worker.port)
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                log_file = log_path.open("a", encoding="utf-8")
-                worker.log_path = str(log_path)
-                log_file.write(
-                    f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting worker GPU {worker.gpu_index}: "
-                    f"{' '.join(command)}\n"
-                )
-                log_file.flush()
-                stdout_target = log_file
-                stderr_target = subprocess.STDOUT
-            except Exception:
-                worker.log_path = None
-                logging.warning(
-                    "%s Unable to open worker log for GPU %s; worker output will be discarded",
-                    LOG_PREFIX,
-                    worker.gpu_index,
-                    exc_info=True,
-                )
+            stdout_target = subprocess.PIPE
+            stderr_target = subprocess.STDOUT
             worker.process = subprocess.Popen(
                 command,
                 cwd=str(self.comfy_root),
                 env=env,
                 stdout=stdout_target,
                 stderr=stderr_target,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
             )
+            if worker.process.stdout is not None:
+                try:
+                    log_path = worker_log_path(self.comfy_root, worker.gpu_index, worker.port, worker.process.pid)
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.touch(exist_ok=True)
+                    worker.log_path = str(log_path)
+                    header = (
+                        f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting worker GPU {worker.gpu_index} "
+                        f"(pid={worker.process.pid}): {' '.join(command)}\n"
+                    )
+                    threading.Thread(
+                        target=_write_worker_output_to_log,
+                        args=(worker.process.stdout, log_path, header),
+                        daemon=True,
+                    ).start()
+                    prune_worker_logs(log_path.parent, worker.gpu_index, current_log=log_path)
+                except Exception:
+                    worker.log_path = None
+                    threading.Thread(target=_drain_worker_output, args=(worker.process.stdout,), daemon=True).start()
+                    logging.warning(
+                        "%s Unable to open worker log for GPU %s; worker output will be discarded",
+                        LOG_PREFIX,
+                        worker.gpu_index,
+                        exc_info=True,
+                    )
             worker.status = "starting"
             logging.info(
                 "%s Started worker for GPU %s on %s (pid=%s, log=%s)",
@@ -755,9 +920,6 @@ class MultiGpuOrchestrator:
             worker.status = "failed"
             worker.error = str(exc)
             logging.exception("%s Failed to start worker for GPU %s", LOG_PREFIX, worker.gpu_index)
-        finally:
-            if log_file is not None:
-                log_file.close()
 
     async def _wait_for_worker(self, worker: WorkerState) -> None:
         deadline = time.monotonic() + self.startup_timeout
@@ -804,7 +966,7 @@ class MultiGpuOrchestrator:
             worker.running = 0
             worker.pending = 0
             return
-        if self._update_exited_worker(worker):
+        if await self._handle_exited_worker(worker):
             return
         try:
             data = await self._fetch_worker_json(worker, "/queue")
@@ -856,7 +1018,7 @@ class MultiGpuOrchestrator:
                 if response.status < 500:
                     body = await response.read()
                     if response.status == 200:
-                        self._remember_prompt_worker(worker, body, json_data.get("prompt"))
+                        self._remember_prompt_worker(worker, body, json_data)
                         await self.refresh_worker_queue(worker)
                         if client_id:
                             await self._send_aggregate_status(str(client_id))
@@ -909,7 +1071,7 @@ class MultiGpuOrchestrator:
         self,
         worker: WorkerState,
         body: bytes,
-        prompt: dict[str, Any] | None = None,
+        prompt_payload: dict[str, Any] | None = None,
     ) -> None:
         try:
             data = json.loads(body.decode("utf-8"))
@@ -920,8 +1082,59 @@ class MultiGpuOrchestrator:
             prompt_id = str(prompt_id)
             worker.accepted_prompt_ids.add(prompt_id)
             self.prompt_to_worker[prompt_id] = worker
+            submitted_payload = prompt_payload if isinstance(prompt_payload, dict) and "prompt" in prompt_payload else None
+            if submitted_payload is not None:
+                worker.pending_prompt_payloads[prompt_id] = copy.deepcopy(submitted_payload)
+            prompt = submitted_payload.get("prompt") if submitted_payload is not None else prompt_payload
             if isinstance(prompt, dict):
                 self.prompt_metadata[prompt_id] = self._build_prompt_metadata(prompt)
+
+    def _forget_worker_prompt(self, worker: WorkerState, data: Any) -> None:
+        prompt_id = data.get("prompt_id") if isinstance(data, dict) else None
+        if not prompt_id:
+            return
+        prompt_id = str(prompt_id)
+        worker.accepted_prompt_ids.discard(prompt_id)
+        worker.pending_prompt_payloads.pop(prompt_id, None)
+
+    async def _requeue_worker_pending_prompts(self, worker: WorkerState) -> None:
+        pending_payloads = list(worker.pending_prompt_payloads.items())
+        if not pending_payloads:
+            return
+        worker.pending_prompt_payloads.clear()
+        worker.accepted_prompt_ids.clear()
+        for old_prompt_id, payload in pending_payloads:
+            try:
+                response = await self._post_worker(worker, "/prompt", payload)
+                body = await response.read()
+                if response.status == 200:
+                    self._remember_prompt_worker(worker, body, payload)
+                    logging.info(
+                        "%s Requeued pending prompt %s on GPU %s",
+                        LOG_PREFIX,
+                        old_prompt_id,
+                        worker.gpu_index,
+                    )
+                else:
+                    worker.pending_prompt_payloads[old_prompt_id] = payload
+                    worker.accepted_prompt_ids.add(old_prompt_id)
+                    logging.warning(
+                        "%s Failed to requeue pending prompt %s on GPU %s: status %s",
+                        LOG_PREFIX,
+                        old_prompt_id,
+                        worker.gpu_index,
+                        response.status,
+                    )
+            except Exception as exc:
+                worker.pending_prompt_payloads[old_prompt_id] = payload
+                worker.accepted_prompt_ids.add(old_prompt_id)
+                logging.warning(
+                    "%s Failed to requeue pending prompt %s on GPU %s: %s",
+                    LOG_PREFIX,
+                    old_prompt_id,
+                    worker.gpu_index,
+                    exc,
+                )
 
     @staticmethod
     def _build_prompt_metadata(prompt: dict[str, Any]) -> dict[str, Any]:
@@ -1050,10 +1263,12 @@ class MultiGpuOrchestrator:
             worker.last_seen = time.time()
         await self.prompt_server.send(message_type, data, client_id)
         if message_type == "execution_success":
+            self._forget_worker_prompt(worker, data)
             await self.refresh_worker_queue(worker)
             await self._send_aggregate_status(client_id)
             self._start_primary_asset_seed()
         elif message_type in {"execution_error", "execution_interrupted"}:
+            self._forget_worker_prompt(worker, data)
             await self.refresh_worker_queue(worker)
             await self._send_aggregate_status(client_id)
 
@@ -1479,6 +1694,7 @@ class MultiGpuOrchestrator:
     ) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
         for worker in self.workers:
+            await self._handle_exited_worker(worker)
             if worker.status in {"failed", "stopped"}:
                 continue
             try:
@@ -1523,6 +1739,7 @@ class MultiGpuOrchestrator:
             {
                 "enabled": True,
                 "auto_start": self.auto_start,
+                "auto_respawn": self.auto_respawn,
                 "started": self._started,
                 "worker_mode": os.environ.get(WORKER_ENV_FLAG) == "1",
                 "routing_policy": self.routing_policy,

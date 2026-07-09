@@ -342,6 +342,7 @@ function installMultiGpuMenu(originalFetchApi) {
     status: null,
     error: "",
     autoStart: true,
+    autoRespawn: true,
   };
 
   if (!document.getElementById("mgpu-sidebar-tab-style")) {
@@ -377,6 +378,8 @@ function installMultiGpuMenu(originalFetchApi) {
       border-bottom: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.09));
     }
     .mgpu-menu-footer {
+      flex-direction: column;
+      align-items: stretch;
       margin-top: auto;
       border-top: 1px solid var(--interface-stroke, rgba(255, 255, 255, 0.09));
       border-bottom: 0;
@@ -577,6 +580,13 @@ function installMultiGpuMenu(originalFetchApi) {
             <span></span>
           </span>
         </label>
+        <label class="mgpu-toggle">
+          <span>Respawn failed workers</span>
+          <span class="mgpu-switch">
+            <input type="checkbox" data-mgpu-auto-respawn ${state.autoRespawn ? "checked" : ""}>
+            <span></span>
+          </span>
+        </label>
       </div>
     `;
 
@@ -624,6 +634,7 @@ function installMultiGpuMenu(originalFetchApi) {
 
     state.panel.querySelector("[data-mgpu-refresh]")?.addEventListener("click", refreshStatus);
     state.panel.querySelector("[data-mgpu-auto-start]")?.addEventListener("change", updateAutoStart);
+    state.panel.querySelector("[data-mgpu-auto-respawn]")?.addEventListener("change", updateAutoRespawn);
     state.panel.querySelectorAll("[data-mgpu-action]").forEach((button) => {
       button.addEventListener("click", () => runWorkerAction(button.dataset.gpuIndex, button.dataset.mgpuAction));
     });
@@ -639,6 +650,7 @@ function installMultiGpuMenu(originalFetchApi) {
       const status = await response.json();
       state.status = status;
       state.autoStart = status.auto_start !== false;
+      state.autoRespawn = status.auto_respawn !== false;
     } catch (error) {
       state.error = `Status unavailable: ${error}`;
     } finally {
@@ -682,6 +694,26 @@ function installMultiGpuMenu(originalFetchApi) {
       state.autoStart = settings.auto_start !== false;
     } catch (error) {
       state.autoStart = !checked;
+      state.error = `Setting update failed: ${error}`;
+    }
+    renderPanel();
+  }
+
+  async function updateAutoRespawn(event) {
+    const checked = Boolean(event.target.checked);
+    state.autoRespawn = checked;
+    renderPanel();
+    try {
+      const response = await originalFetchApi("/mgpu/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ auto_respawn: checked }),
+      });
+      if (!response.ok) throw new Error(`settings ${response.status}`);
+      const settings = await response.json();
+      state.autoRespawn = settings.auto_respawn !== false;
+    } catch (error) {
+      state.autoRespawn = !checked;
       state.error = `Setting update failed: ${error}`;
     }
     renderPanel();
