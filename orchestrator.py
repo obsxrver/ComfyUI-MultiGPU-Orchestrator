@@ -59,6 +59,9 @@ FORWARDED_WS_TYPES = {
     "execution_interrupted",
     "notification",
 }
+DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
+
+
 @dataclass
 class WorkerState:
     gpu_index: int
@@ -998,7 +1001,7 @@ class MultiGpuOrchestrator:
                 return worker
         return candidates[0]
 
-    async def proxy_prompt(self, request: Any) -> Any:
+    async def proxy_prompt(self, request: Any, no_worker_fallback: Any = None) -> Any:
         await self.start()
         await self.refresh_queues()
         json_data = await request.json()
@@ -1040,6 +1043,13 @@ class MultiGpuOrchestrator:
                     worker.gpu_index,
                     exc,
                 )
+
+        if no_worker_fallback is not None:
+            logging.warning(
+                "%s No healthy workers are available; submitting prompt to the primary ComfyUI server",
+                LOG_PREFIX,
+            )
+            return await no_worker_fallback(request)
 
         return web.json_response(
             {
@@ -1763,6 +1773,28 @@ async def _read_json_or_empty(request: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def create_direct_prompt_routing_middleware(orchestrator: MultiGpuOrchestrator) -> Any:
+    @web.middleware
+    async def route_direct_prompt_request(request: Any, handler: Any) -> Any:
+        if request.method == "POST" and request.path in DIRECT_PROMPT_PATHS:
+            return await orchestrator.proxy_prompt(request, no_worker_fallback=handler)
+        return await handler(request)
+
+    return route_direct_prompt_request
+
+
+def install_direct_prompt_routing(prompt_server: Any, orchestrator: MultiGpuOrchestrator) -> bool:
+    try:
+        middleware = create_direct_prompt_routing_middleware(orchestrator)
+        prompt_server.app.middlewares.append(middleware)
+    except Exception:
+        logging.exception("%s Failed to enable direct /prompt API routing", LOG_PREFIX)
+        return False
+
+    logging.info("%s Direct /prompt API requests will be routed to workers", LOG_PREFIX)
+    return True
+
+
 _ORCHESTRATOR: MultiGpuOrchestrator | None = None
 
 
@@ -1784,6 +1816,7 @@ def register_routes() -> MultiGpuOrchestrator | None:
     orchestrator = MultiGpuOrchestrator(prompt_server)
     _ORCHESTRATOR = orchestrator
     routes = prompt_server.routes
+    install_direct_prompt_routing(prompt_server, orchestrator)
 
     @routes.get("/mgpu/status")
     async def mgpu_status(_request):

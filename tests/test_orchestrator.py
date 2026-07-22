@@ -4,6 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -16,6 +20,7 @@ from orchestrator import (  # noqa: E402
     aggregate_tags_payload,
     build_queue_info,
     build_worker_command,
+    create_direct_prompt_routing_middleware,
     load_config,
     parse_device_list,
     prune_worker_logs,
@@ -324,6 +329,69 @@ class FakeResponse:
 
 
 class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_prompt_middleware_routes_native_and_api_paths(self):
+        orchestrator = SimpleNamespace(proxy_prompt=AsyncMock(return_value="worker-response"))
+        middleware = create_direct_prompt_routing_middleware(orchestrator)
+        native_handler = AsyncMock(return_value="native-response")
+
+        for path in ("/prompt", "/api/prompt"):
+            request = SimpleNamespace(method="POST", path=path)
+
+            response = await middleware(request, native_handler)
+
+            self.assertEqual(response, "worker-response")
+            orchestrator.proxy_prompt.assert_awaited_with(request, no_worker_fallback=native_handler)
+
+        native_handler.assert_not_awaited()
+
+    async def test_direct_prompt_middleware_leaves_other_requests_unchanged(self):
+        orchestrator = SimpleNamespace(proxy_prompt=AsyncMock(return_value="worker-response"))
+        middleware = create_direct_prompt_routing_middleware(orchestrator)
+        native_handler = AsyncMock(return_value="native-response")
+        request = SimpleNamespace(method="GET", path="/prompt")
+
+        response = await middleware(request, native_handler)
+
+        self.assertEqual(response, "native-response")
+        native_handler.assert_awaited_once_with(request)
+        orchestrator.proxy_prompt.assert_not_awaited()
+
+    async def test_prompt_proxy_uses_native_fallback_without_healthy_workers(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        orchestrator._started = True
+        orchestrator.workers = [
+            WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000", status="failed")
+        ]
+        orchestrator.refresh_queues = AsyncMock()
+        request = SimpleNamespace(json=AsyncMock(return_value={"prompt": {}}))
+        native_handler = AsyncMock(return_value="native-response")
+
+        response = await orchestrator.proxy_prompt(request, no_worker_fallback=native_handler)
+
+        self.assertEqual(response, "native-response")
+        native_handler.assert_awaited_once_with(request)
+
+    async def test_native_fallback_can_reread_direct_prompt_body(self):
+        class FallbackOrchestrator:
+            routed_payload = None
+
+            async def proxy_prompt(self, request, no_worker_fallback=None):
+                self.routed_payload = await request.json()
+                return await no_worker_fallback(request)
+
+        orchestrator = FallbackOrchestrator()
+        app = web.Application(middlewares=[create_direct_prompt_routing_middleware(orchestrator)])
+
+        async def native_prompt(request):
+            return web.json_response({"payload": await request.json()})
+
+        app.router.add_post("/prompt", native_prompt)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/prompt", json={"prompt": {"1": {"class_type": "SaveImage"}}})
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {"payload": orchestrator.routed_payload})
+
     async def test_worker_status_message_sends_aggregate_status(self):
         prompt_server = FakePromptServer()
         orchestrator = MultiGpuOrchestrator(prompt_server=prompt_server)

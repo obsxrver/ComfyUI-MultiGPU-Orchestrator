@@ -24,6 +24,8 @@ UI and orchestrator. Worker processes do the generation work.
 
 The normal ComfyUI frontend is patched so queueing, status polling, job progress, and media assets are routed through the orchestrator automatically.
 
+Direct API submissions work the same way: `POST /prompt` (and `/api/prompt`) on the main server is dispatched to the least-busy healthy worker. If no worker is available, the request falls back to the main ComfyUI process.
+
 ## Install
 
 Clone this repository into `ComfyUI/custom_nodes/`:
