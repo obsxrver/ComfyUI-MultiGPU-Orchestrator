@@ -26,6 +26,11 @@ The normal ComfyUI frontend is patched so queueing, status polling, job progress
 
 Direct API submissions work the same way: `POST /prompt` (and `/api/prompt`) on the main server is dispatched to the least-busy healthy worker. If no worker is available, the request falls back to the main ComfyUI process.
 
+The Console keeps the standard `Logs` tab for the main process and adds a
+`GPU N` tab for every worker. Worker output is written to
+`ComfyUI/logs/mgpu-workers/gpu-N.log`; these files are cleared when the
+orchestrator starts and reused for worker restarts during that session.
+
 ## Install
 
 Clone this repository into `ComfyUI/custom_nodes/`:

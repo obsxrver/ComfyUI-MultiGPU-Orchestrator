@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -23,7 +24,8 @@ from orchestrator import (  # noqa: E402
     create_direct_prompt_routing_middleware,
     load_config,
     parse_device_list,
-    prune_worker_logs,
+    read_log_chunk,
+    reset_worker_logs,
     route_with_query,
     save_config,
     synthesize_jobs_payload,
@@ -89,42 +91,62 @@ class OrchestratorPureTests(unittest.TestCase):
         self.assertIn("/comfy/extra.yaml", command)
         self.assertIn("--enable-assets", command)
 
-    def test_worker_log_path_includes_timestamp_and_pid(self):
+    def test_worker_log_path_is_stable_per_gpu(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             previous = os.environ.get("COMFYUI_MGPU_LOG_DIR")
             os.environ["COMFYUI_MGPU_LOG_DIR"] = tmpdir
             try:
-                path = worker_log_path(Path("/comfy"), gpu_index=2, port=9123, pid=4567, timestamp="20260708-153000")
+                path = worker_log_path(Path("/comfy"), gpu_index=2)
             finally:
                 if previous is None:
                     os.environ.pop("COMFYUI_MGPU_LOG_DIR", None)
                 else:
                     os.environ["COMFYUI_MGPU_LOG_DIR"] = previous
 
-        self.assertEqual(path.name, "gpu-2-port-9123-20260708-153000-pid-4567.log")
+        self.assertEqual(path.name, "gpu-2.log")
         self.assertEqual(path.parent, Path(tmpdir))
 
-    def test_prune_worker_logs_keeps_current_and_two_previous_per_gpu(self):
+    def test_reset_worker_logs_removes_old_logs_and_initializes_each_gpu(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_dir = Path(tmpdir)
-            paths = []
-            for index in range(5):
-                path = log_dir / f"gpu-0-port-900{index}-20260708-15300{index}-pid-10{index}.log"
-                path.write_text(f"log {index}", encoding="utf-8")
-                os.utime(path, (index + 1, index + 1))
-                paths.append(path)
-            other_gpu = log_dir / "gpu-1-port-9010-20260708-153010-pid-200.log"
-            other_gpu.write_text("other", encoding="utf-8")
-            os.utime(other_gpu, (1, 1))
+            old_log = log_dir / "gpu-0-port-9000-20260708-153000-pid-100.log"
+            old_log.write_text("old", encoding="utf-8")
+            stable_log = log_dir / "gpu-0.log"
+            stable_log.write_text("previous run", encoding="utf-8")
+            unrelated = log_dir / "README.txt"
+            unrelated.write_text("keep", encoding="utf-8")
+            previous = os.environ.get("COMFYUI_MGPU_LOG_DIR")
+            os.environ["COMFYUI_MGPU_LOG_DIR"] = tmpdir
+            try:
+                paths = reset_worker_logs(Path("/comfy"), [0, 2])
+            finally:
+                if previous is None:
+                    os.environ.pop("COMFYUI_MGPU_LOG_DIR", None)
+                else:
+                    os.environ["COMFYUI_MGPU_LOG_DIR"] = previous
 
-            prune_worker_logs(log_dir, gpu_index=0, current_log=paths[4])
+            self.assertEqual(paths, {0: log_dir / "gpu-0.log", 2: log_dir / "gpu-2.log"})
+            self.assertFalse(old_log.exists())
+            self.assertEqual((log_dir / "gpu-0.log").read_text(encoding="utf-8"), "")
+            self.assertEqual((log_dir / "gpu-2.log").read_text(encoding="utf-8"), "")
+            self.assertTrue(unrelated.exists())
 
-            self.assertFalse(paths[0].exists())
-            self.assertFalse(paths[1].exists())
-            self.assertTrue(paths[2].exists())
-            self.assertTrue(paths[3].exists())
-            self.assertTrue(paths[4].exists())
-            self.assertTrue(other_gpu.exists())
+    def test_read_log_chunk_tails_then_reads_incrementally_and_resets_after_truncation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "gpu-0.log"
+            path.write_bytes(b"old\nrecent")
+
+            initial = read_log_chunk(path, None, max_bytes=6)
+            self.assertEqual(initial, {"content": "recent", "cursor": 10, "reset": True})
+
+            with path.open("ab") as log_file:
+                log_file.write(b"\nnext")
+            incremental = read_log_chunk(path, initial["cursor"], max_bytes=20)
+            self.assertEqual(incremental, {"content": "\nnext", "cursor": 15, "reset": False})
+
+            path.write_bytes(b"new")
+            truncated = read_log_chunk(path, incremental["cursor"], max_bytes=20)
+            self.assertEqual(truncated, {"content": "new", "cursor": 3, "reset": True})
 
     def test_select_worker_uses_least_busy_with_round_robin_tie(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=SimpleNamespace())
@@ -492,6 +514,32 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(session.calls, [("HEAD", "http://127.0.0.1:9000/api/assets/hash/blake3:test")])
+
+    async def test_worker_log_response_returns_requested_worker_chunk(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "gpu-3.log"
+            log_path.write_bytes(b"first\nsecond")
+            orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+            orchestrator.log_session_id = "test-session"
+            orchestrator.workers = [
+                WorkerState(gpu_index=3, port=9003, url="http://127.0.0.1:9003", log_path=str(log_path))
+            ]
+
+            response = await orchestrator.worker_log_response(3, 6)
+            payload = json.loads(response.text)
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                payload,
+                {
+                    "content": "second",
+                    "cursor": 12,
+                    "reset": False,
+                    "gpu_index": 3,
+                    "session_id": "test-session",
+                },
+            )
+            self.assertEqual((await orchestrator.worker_log_response(4, None)).status, 404)
 
     async def test_stop_worker_marks_worker_stopped_without_starting_others(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())

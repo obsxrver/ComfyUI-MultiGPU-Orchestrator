@@ -28,7 +28,7 @@ WORKER_ENV_FLAG = "COMFYUI_MGPU_WORKER"
 CONFIG_PATH_ENV = "COMFYUI_MGPU_CONFIG"
 CONFIG_FILE_NAME = "mgpu_config.json"
 LOG_DIR_ENV = "COMFYUI_MGPU_LOG_DIR"
-WORKER_LOGS_TO_KEEP = 3
+WORKER_LOG_READ_LIMIT = 256 * 1024
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_JOBS_FETCH_LIMIT = 1000
 ADDRESS_IN_USE_MARKERS = (
@@ -138,36 +138,46 @@ def worker_log_dir(comfy_root: Path) -> Path:
     return Path(configured) if configured else comfy_root / "logs" / "mgpu-workers"
 
 
-def worker_log_path(comfy_root: Path, gpu_index: int, port: int, pid: int, timestamp: str | None = None) -> Path:
-    stamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
-    return worker_log_dir(comfy_root) / f"gpu-{gpu_index}-port-{port}-{stamp}-pid-{pid}.log"
+def worker_log_path(comfy_root: Path, gpu_index: int) -> Path:
+    return worker_log_dir(comfy_root) / f"gpu-{gpu_index}.log"
 
 
-def prune_worker_logs(log_dir: Path, gpu_index: int, keep: int = WORKER_LOGS_TO_KEEP, current_log: Path | None = None) -> None:
-    if keep < 1:
-        keep = 1
+def reset_worker_logs(comfy_root: Path, gpu_indices: list[int]) -> dict[int, Path]:
+    log_dir = worker_log_dir(comfy_root)
+    log_paths = {gpu_index: worker_log_path(comfy_root, gpu_index) for gpu_index in gpu_indices}
     try:
-        paths = [path for path in log_dir.glob(f"gpu-{gpu_index}-*.log") if path.is_file()]
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stale_paths = [path for path in log_dir.glob("*.log") if path.is_file()]
     except OSError:
-        logging.warning("%s Unable to list worker logs for GPU %s", LOG_PREFIX, gpu_index, exc_info=True)
-        return
+        logging.warning("%s Unable to initialize worker log directory %s", LOG_PREFIX, log_dir, exc_info=True)
+        return log_paths
 
-    def sort_key(path: Path) -> tuple[int, str]:
-        try:
-            return path.stat().st_mtime_ns, path.name
-        except OSError:
-            return 0, path.name
-
-    paths.sort(key=sort_key, reverse=True)
-    if current_log is not None:
-        current_log = current_log.resolve()
-        paths = sorted(paths, key=lambda path: path.resolve() == current_log, reverse=True)
-
-    for stale_path in paths[keep:]:
+    for stale_path in stale_paths:
         try:
             stale_path.unlink()
         except OSError:
             logging.warning("%s Unable to delete old worker log %s", LOG_PREFIX, stale_path, exc_info=True)
+
+    for log_path in log_paths.values():
+        try:
+            log_path.write_text("", encoding="utf-8")
+        except OSError:
+            logging.warning("%s Unable to initialize worker log %s", LOG_PREFIX, log_path, exc_info=True)
+    return log_paths
+
+
+def read_log_chunk(log_path: Path, cursor: int | None, max_bytes: int = WORKER_LOG_READ_LIMIT) -> dict[str, Any]:
+    max_bytes = max(int(max_bytes), 1)
+    try:
+        size = log_path.stat().st_size
+        reset = cursor is None or cursor < 0 or cursor > size
+        start = max(size - max_bytes, 0) if reset else cursor
+        with log_path.open("rb") as log_file:
+            log_file.seek(start)
+            data = log_file.read(max_bytes)
+    except OSError:
+        return {"content": "", "cursor": 0, "reset": True}
+    return {"content": data.decode("utf-8", errors="replace"), "cursor": start + len(data), "reset": reset}
 
 
 def _drain_worker_output(pipe: Any) -> None:
@@ -623,6 +633,7 @@ class MultiGpuOrchestrator:
         self._started = False
         self._start_lock = asyncio.Lock()
         self._comfy_args: Any = None
+        self.log_session_id = str(time.time_ns())
         self.config = load_config()
         self.auto_start = bool(self.config.get("auto_start", True))
         self.auto_respawn = bool(self.config.get("auto_respawn", True))
@@ -653,6 +664,7 @@ class MultiGpuOrchestrator:
             await self._ensure_session()
 
             devices = discover_cuda_devices()
+            log_paths = reset_worker_logs(self.comfy_root, devices)
             if not devices:
                 logging.warning("%s No CUDA devices found; UI will fall back to native /prompt", LOG_PREFIX)
                 return
@@ -665,6 +677,7 @@ class MultiGpuOrchestrator:
                     gpu_index=gpu_index,
                     port=port,
                     url=f"http://127.0.0.1:{port}",
+                    log_path=str(log_paths[gpu_index]),
                 )
                 self.workers.append(worker)
                 self._spawn_worker(worker, self._comfy_args)
@@ -887,7 +900,10 @@ class MultiGpuOrchestrator:
             )
             if worker.process.stdout is not None:
                 try:
-                    log_path = worker_log_path(self.comfy_root, worker.gpu_index, worker.port, worker.process.pid)
+                    log_path = Path(worker.log_path) if worker.log_path else worker_log_path(
+                        self.comfy_root,
+                        worker.gpu_index,
+                    )
                     log_path.parent.mkdir(parents=True, exist_ok=True)
                     log_path.touch(exist_ok=True)
                     worker.log_path = str(log_path)
@@ -900,7 +916,6 @@ class MultiGpuOrchestrator:
                         args=(worker.process.stdout, log_path, header),
                         daemon=True,
                     ).start()
-                    prune_worker_logs(log_path.parent, worker.gpu_index, current_log=log_path)
                 except Exception:
                     worker.log_path = None
                     threading.Thread(target=_drain_worker_output, args=(worker.process.stdout,), daemon=True).start()
@@ -1764,6 +1779,17 @@ class MultiGpuOrchestrator:
         payload = await _read_json_or_empty(request)
         return web.json_response(self.update_config(payload))
 
+    async def worker_log_response(self, gpu_index: int, cursor: int | None) -> Any:
+        worker = self._worker_for_gpu(gpu_index)
+        if worker is None:
+            return web.json_response({"error": "worker not found"}, status=404)
+        if not worker.log_path:
+            return web.json_response({"error": "worker log is unavailable"}, status=404)
+        payload = read_log_chunk(Path(worker.log_path), cursor)
+        payload["gpu_index"] = worker.gpu_index
+        payload["session_id"] = self.log_session_id
+        return web.json_response(payload)
+
 
 async def _read_json_or_empty(request: Any) -> dict[str, Any]:
     try:
@@ -1851,6 +1877,16 @@ def register_routes() -> MultiGpuOrchestrator | None:
         if worker is None:
             return web.json_response({"error": "worker not found"}, status=404)
         return web.json_response({"worker": worker.public_dict()})
+
+    @routes.get("/mgpu/workers/{gpu_index}/logs")
+    async def mgpu_worker_logs(request):
+        try:
+            gpu_index = int(request.match_info.get("gpu_index"))
+            cursor_value = request.rel_url.query.get("cursor")
+            cursor = int(cursor_value) if cursor_value is not None else None
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid worker log request"}, status=400)
+        return await orchestrator.worker_log_response(gpu_index, cursor)
 
     @routes.post("/mgpu/prompt")
     async def mgpu_prompt(request):

@@ -7,6 +7,9 @@ let warnedFallback = false;
 let bypassDirectFetchRewrite = false;
 const rowProgressByPrompt = new Map();
 let rowProgressFrame = 0;
+const registeredWorkerLogTabs = new Set();
+const WORKER_LOG_POLL_INTERVAL_MS = 750;
+const WORKER_LOG_RENDER_LIMIT = 1024 * 1024;
 
 function normalizeRoute(route) {
   return String(route || "");
@@ -321,6 +324,196 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function installWorkerLogStyles() {
+  if (document.getElementById("mgpu-worker-log-style")) return;
+  const style = document.createElement("style");
+  style.id = "mgpu-worker-log-style";
+  style.textContent = `
+    .mgpu-log-panel {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: auto;
+      color: var(--fg-color, #ededed);
+      background: var(--comfy-menu-bg, var(--bg-color, #181818));
+    }
+    .mgpu-log-output {
+      box-sizing: border-box;
+      min-width: 100%;
+      min-height: 100%;
+      width: max-content;
+      margin: 0;
+      padding: 8px 10px;
+      color: inherit;
+      background: transparent;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .mgpu-log-message {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 8px 10px;
+      color: #ff9a9a;
+      background: var(--comfy-menu-bg, var(--bg-color, #181818));
+      font: 12px/1.35 var(--font-family, system-ui, sans-serif);
+    }
+    .mgpu-log-slot {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function normalizeWorkerLogText(value) {
+  return String(value ?? "")
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\r(?!\n)/g, "\n");
+}
+
+function trimWorkerLogText(value) {
+  if (value.length <= WORKER_LOG_RENDER_LIMIT) return value;
+  const trimmed = value.slice(-WORKER_LOG_RENDER_LIMIT);
+  const firstNewline = trimmed.indexOf("\n");
+  return firstNewline >= 0 ? trimmed.slice(firstNewline + 1) : trimmed;
+}
+
+function createWorkerLogPanel(gpuIndex) {
+  let output = null;
+  let message = null;
+  let cursor = null;
+  let sessionId = null;
+  let timer = 0;
+  let controller = null;
+  let loading = false;
+
+  function destroy() {
+    if (timer) clearTimeout(timer);
+    controller?.abort();
+    timer = 0;
+    controller = null;
+    output = null;
+    message = null;
+    cursor = null;
+    sessionId = null;
+    loading = false;
+  }
+
+  function scheduleRefresh() {
+    if (!output) return;
+    timer = setTimeout(refresh, WORKER_LOG_POLL_INTERVAL_MS);
+  }
+
+  async function refresh() {
+    if (!output || loading) return;
+    loading = true;
+    const currentOutput = output;
+    const currentMessage = message;
+    const currentController = new AbortController();
+    controller = currentController;
+    const wasNearBottom =
+      currentOutput.parentElement.scrollHeight -
+        currentOutput.parentElement.scrollTop -
+        currentOutput.parentElement.clientHeight <
+      40;
+    try {
+      const suffix = cursor === null ? "" : `?cursor=${encodeURIComponent(cursor)}`;
+      const response = await api.fetchApi(`/mgpu/workers/${gpuIndex}/logs${suffix}`, {
+        signal: currentController.signal,
+      });
+      if (!response.ok) throw new Error(`status ${response.status}`);
+      const payload = await response.json();
+      if (currentController.signal.aborted || output !== currentOutput) return;
+      const content = normalizeWorkerLogText(payload.content);
+      const nextCursor = Number(payload.cursor);
+      const nextSessionId = String(payload.session_id || "");
+      if (!Number.isFinite(nextCursor) || nextCursor < 0) {
+        throw new Error("invalid cursor");
+      }
+      const sessionChanged = sessionId !== null && nextSessionId !== sessionId;
+      if (sessionChanged && !payload.reset) {
+        currentOutput.textContent = "";
+        currentMessage.hidden = true;
+        cursor = null;
+        sessionId = nextSessionId;
+        return;
+      }
+      const shouldReset = payload.reset || sessionChanged;
+      const previous = shouldReset ? "" : currentOutput.textContent || "";
+      if (shouldReset || content) {
+        currentOutput.textContent = trimWorkerLogText(previous + content);
+      }
+      cursor = nextCursor;
+      sessionId = nextSessionId;
+      currentMessage.hidden = true;
+      if ((wasNearBottom || shouldReset) && (shouldReset || content)) {
+        currentOutput.parentElement.scrollTop = currentOutput.parentElement.scrollHeight;
+      }
+    } catch (error) {
+      if (currentController.signal.aborted || output !== currentOutput) return;
+      currentMessage.textContent = `Unable to load GPU ${gpuIndex} logs: ${error}`;
+      currentMessage.hidden = false;
+    } finally {
+      if (controller === currentController) {
+        loading = false;
+        controller = null;
+      }
+      scheduleRefresh();
+    }
+  }
+
+  function render(container) {
+    destroy();
+    installWorkerLogStyles();
+    container.classList.add("mgpu-log-slot");
+    const panel = document.createElement("div");
+    panel.className = "mgpu-log-panel";
+    message = document.createElement("div");
+    message.className = "mgpu-log-message";
+    message.hidden = true;
+    output = document.createElement("pre");
+    output.className = "mgpu-log-output";
+    output.setAttribute("aria-label", `GPU ${gpuIndex} worker logs`);
+    panel.append(message, output);
+    container.replaceChildren(panel);
+    refresh();
+  }
+
+  return { render, destroy };
+}
+
+function registerWorkerLogTabs(workers) {
+  for (const worker of workers || []) {
+    const gpuIndex = Number(worker?.gpu_index);
+    if (!Number.isInteger(gpuIndex) || registeredWorkerLogTabs.has(gpuIndex)) continue;
+    const panel = createWorkerLogPanel(gpuIndex);
+    try {
+      app.registerExtension({
+        name: `${EXTENSION_NAME}.logs.gpu-${gpuIndex}`,
+        bottomPanelTabs: [
+          {
+            id: `mgpu-worker-log-${gpuIndex}`,
+            title: `GPU ${gpuIndex}`,
+            targetPanel: "terminal",
+            type: "custom",
+            render: panel.render,
+            destroy: panel.destroy,
+          },
+        ],
+      });
+      registeredWorkerLogTabs.add(gpuIndex);
+    } catch (error) {
+      console.warn(`[ComfyUI-MGPU] Unable to register GPU ${gpuIndex} log tab.`, error);
+    }
+  }
 }
 
 function installMultiGpuMenu(originalFetchApi) {
@@ -651,6 +844,7 @@ function installMultiGpuMenu(originalFetchApi) {
       state.status = status;
       state.autoStart = status.auto_start !== false;
       state.autoRespawn = status.auto_respawn !== false;
+      registerWorkerLogTabs(status.workers);
     } catch (error) {
       state.error = `Status unavailable: ${error}`;
     } finally {
@@ -824,6 +1018,7 @@ app.registerExtension({
           return;
         }
         const status = await response.json();
+        registerWorkerLogTabs(status.workers);
         if (!status.started) {
           console.info("[ComfyUI-MGPU] Worker startup is not active.");
           return;
