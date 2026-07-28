@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from orchestrator import (  # noqa: E402
+    PARENT_PID_ENV,
     MultiGpuOrchestrator,
     WorkerState,
     aggregate_assets_payload,
@@ -299,9 +300,29 @@ class OrchestratorPureTests(unittest.TestCase):
             old_value = os.environ.get("COMFYUI_MGPU_CONFIG")
             os.environ["COMFYUI_MGPU_CONFIG"] = str(config_file)
             try:
-                self.assertEqual(load_config(), {"auto_start": True, "auto_respawn": True})
-                save_config({"auto_start": False, "auto_respawn": False})
-                self.assertEqual(load_config(), {"auto_start": False, "auto_respawn": False})
+                self.assertEqual(
+                    load_config(),
+                    {
+                        "auto_start": True,
+                        "auto_respawn": True,
+                        "requeue_pending_on_respawn": True,
+                    },
+                )
+                save_config(
+                    {
+                        "auto_start": False,
+                        "auto_respawn": False,
+                        "requeue_pending_on_respawn": False,
+                    }
+                )
+                self.assertEqual(
+                    load_config(),
+                    {
+                        "auto_start": False,
+                        "auto_respawn": False,
+                        "requeue_pending_on_respawn": False,
+                    },
+                )
             finally:
                 if old_value is None:
                     os.environ.pop("COMFYUI_MGPU_CONFIG", None)
@@ -330,15 +351,19 @@ class FakeProcess:
     def __init__(self, returncode=1, pid=1234):
         self.returncode = returncode
         self.pid = pid
+        self.terminated = False
+        self.killed = False
 
     def poll(self):
         return self.returncode
 
     def terminate(self):
-        pass
+        self.terminated = True
+        self.returncode = -15
 
     def kill(self):
-        pass
+        self.killed = True
+        self.returncode = -9
 
 
 class FakeResponse:
@@ -351,6 +376,35 @@ class FakeResponse:
 
 
 class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_snapshot_removes_completed_prompts_from_requeue_ledger(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        worker = WorkerState(
+            gpu_index=0,
+            port=9000,
+            url="http://127.0.0.1:9000",
+            status="healthy",
+        )
+        payload = {"prompt": {"1": {"class_type": "SaveImage"}}}
+        for prompt_id in ("running-prompt", "pending-prompt", "completed-prompt"):
+            worker.accepted_prompt_ids.add(prompt_id)
+            worker.pending_prompt_payloads[prompt_id] = payload
+        orchestrator._fetch_worker_json = AsyncMock(
+            return_value={
+                "queue_running": [[1, "running-prompt", {}, {}, []]],
+                "queue_pending": [[2, "pending-prompt", {}, {}, []]],
+            }
+        )
+
+        await orchestrator.refresh_worker_queue(worker)
+
+        self.assertEqual(worker.running, 1)
+        self.assertEqual(worker.pending, 1)
+        self.assertEqual(
+            set(worker.pending_prompt_payloads),
+            {"running-prompt", "pending-prompt"},
+        )
+        self.assertNotIn("completed-prompt", worker.accepted_prompt_ids)
+
     async def test_direct_prompt_middleware_routes_native_and_api_paths(self):
         orchestrator = SimpleNamespace(proxy_prompt=AsyncMock(return_value="worker-response"))
         middleware = create_direct_prompt_routing_middleware(orchestrator)
@@ -599,6 +653,78 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("old-prompt", worker.pending_prompt_payloads)
         self.assertIn("new-prompt", worker.pending_prompt_payloads)
         self.assertIn("new-prompt", worker.accepted_prompt_ids)
+
+    async def test_respawn_discards_pending_prompts_when_requeue_toggle_is_off(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        orchestrator.requeue_pending_on_respawn = False
+        worker = WorkerState(
+            gpu_index=0,
+            port=9000,
+            url="http://127.0.0.1:9000",
+            process=FakeProcess(returncode=1),
+            status="healthy",
+        )
+        worker.accepted_prompt_ids.add("old-prompt")
+        worker.pending_prompt_payloads["old-prompt"] = {
+            "prompt": {"1": {"class_type": "SaveImage"}}
+        }
+        orchestrator.workers = [worker]
+        orchestrator.prompt_to_worker["old-prompt"] = worker
+
+        async def fake_start(refreshed_worker, *, prefer_existing_port):
+            self.assertTrue(prefer_existing_port)
+            refreshed_worker.process = FakeProcess(returncode=None, pid=5678)
+            refreshed_worker.status = "healthy"
+            return True
+
+        orchestrator._start_worker_with_retry = fake_start
+        orchestrator._post_worker = AsyncMock()
+        orchestrator.refresh_worker_queue = AsyncMock()
+
+        self.assertTrue(await orchestrator._handle_exited_worker(worker))
+
+        orchestrator._post_worker.assert_not_awaited()
+        self.assertEqual(worker.pending_prompt_payloads, {})
+        self.assertEqual(worker.accepted_prompt_ids, set())
+        self.assertNotIn("old-prompt", orchestrator.prompt_to_worker)
+
+    async def test_close_stops_all_workers_and_closes_session(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        processes = [
+            FakeProcess(returncode=None, pid=1001),
+            FakeProcess(returncode=None, pid=1002),
+        ]
+        orchestrator.workers = [
+            WorkerState(
+                gpu_index=index,
+                port=9000 + index,
+                url=f"http://127.0.0.1:{9000 + index}",
+                process=process,
+                status="healthy",
+            )
+            for index, process in enumerate(processes)
+        ]
+        session = SimpleNamespace(close=AsyncMock())
+        orchestrator._session = session
+
+        await orchestrator.close()
+
+        self.assertTrue(orchestrator._closing)
+        self.assertTrue(all(process.terminated for process in processes))
+        self.assertTrue(all(worker.process is None for worker in orchestrator.workers))
+        self.assertTrue(all(worker.status == "stopped" for worker in orchestrator.workers))
+        session.close.assert_awaited_once()
+
+    async def test_spawned_worker_receives_primary_process_id(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        worker = WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000")
+        process = FakeProcess(returncode=None)
+        process.stdout = None
+
+        with patch("orchestrator.subprocess.Popen", return_value=process) as popen:
+            orchestrator._spawn_worker(worker, None)
+
+        self.assertEqual(popen.call_args.kwargs["env"][PARENT_PID_ENV], str(os.getpid()))
 
     async def test_failed_auto_respawn_is_blocked_until_manual_restart(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())

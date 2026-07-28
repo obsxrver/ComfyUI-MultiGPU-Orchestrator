@@ -12,7 +12,13 @@ def _register_orchestrator():
         return
 
     if os.environ.get("COMFYUI_MGPU_WORKER") == "1":
-        logging.info("[ComfyUI-MGPU] Worker mode active; orchestration disabled")
+        from .orchestrator import start_parent_watchdog
+
+        watchdog_started = start_parent_watchdog()
+        logging.info(
+            "[ComfyUI-MGPU] Worker mode active; orchestration disabled%s",
+            " and primary-process watchdog started" if watchdog_started else "",
+        )
         return
 
     try:

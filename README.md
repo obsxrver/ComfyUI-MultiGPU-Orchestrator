@@ -31,6 +31,12 @@ The Console keeps the standard `Logs` tab for the main process and adds a
 `ComfyUI/logs/mgpu-workers/gpu-N.log`; these files are cleared when the
 orchestrator starts and reused for worker restarts during that session.
 
+The MultiGPU sidebar settings can automatically respawn failed workers and,
+independently, re-queue only the jobs that were still running or pending in the
+worker's last queue snapshot. Completed jobs are removed from the replay ledger.
+Workers also stop when the primary ComfyUI server shuts down, restarts, or exits
+unexpectedly.
+
 ## Install
 
 Clone this repository into `ComfyUI/custom_nodes/`:

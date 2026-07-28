@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - ComfyUI provides aiohttp at runtime.
 
 LOG_PREFIX = "[ComfyUI-MGPU]"
 WORKER_ENV_FLAG = "COMFYUI_MGPU_WORKER"
+PARENT_PID_ENV = "COMFYUI_MGPU_PARENT_PID"
 CONFIG_PATH_ENV = "COMFYUI_MGPU_CONFIG"
 CONFIG_FILE_NAME = "mgpu_config.json"
 LOG_DIR_ENV = "COMFYUI_MGPU_LOG_DIR"
@@ -60,6 +61,69 @@ FORWARDED_WS_TYPES = {
     "notification",
 }
 DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
+_PARENT_WATCHDOG_STARTED = False
+
+
+def _parent_process_is_alive(parent_pid: int) -> bool:
+    if parent_pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            synchronize = 0x00100000
+            wait_timeout = 0x00000102
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(synchronize, False, parent_pid)
+            if not handle:
+                return False
+            try:
+                return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        if os.getppid() != parent_pid:
+            return False
+        os.kill(parent_pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _watch_parent_process(parent_pid: int) -> None:
+    while _parent_process_is_alive(parent_pid):
+        time.sleep(1)
+    logging.warning("%s Primary ComfyUI process %s exited; stopping worker", LOG_PREFIX, parent_pid)
+    os._exit(0)
+
+
+def start_parent_watchdog() -> bool:
+    global _PARENT_WATCHDOG_STARTED
+    if _PARENT_WATCHDOG_STARTED:
+        return True
+    try:
+        parent_pid = int(os.environ.get(PARENT_PID_ENV, ""))
+    except (TypeError, ValueError):
+        return False
+    if parent_pid <= 0 or parent_pid == os.getpid():
+        return False
+    _PARENT_WATCHDOG_STARTED = True
+    threading.Thread(
+        target=_watch_parent_process,
+        args=(parent_pid,),
+        name="mgpu-parent-watchdog",
+        daemon=True,
+    ).start()
+    return True
 
 
 @dataclass
@@ -326,6 +390,7 @@ def load_config() -> dict[str, Any]:
     return {
         "auto_start": bool(data.get("auto_start", True)),
         "auto_respawn": bool(data.get("auto_respawn", True)),
+        "requeue_pending_on_respawn": bool(data.get("requeue_pending_on_respawn", True)),
     }
 
 
@@ -333,6 +398,7 @@ def save_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = {
         "auto_start": bool(config.get("auto_start", True)),
         "auto_respawn": bool(config.get("auto_respawn", True)),
+        "requeue_pending_on_respawn": bool(config.get("requeue_pending_on_respawn", True)),
     }
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -631,12 +697,14 @@ class MultiGpuOrchestrator:
         self._session: aiohttp.ClientSession | None = None
         self._rr_index = 0
         self._started = False
+        self._closing = False
         self._start_lock = asyncio.Lock()
         self._comfy_args: Any = None
         self.log_session_id = str(time.time_ns())
         self.config = load_config()
         self.auto_start = bool(self.config.get("auto_start", True))
         self.auto_respawn = bool(self.config.get("auto_respawn", True))
+        self.requeue_pending_on_respawn = bool(self.config.get("requeue_pending_on_respawn", True))
         self.routing_policy = "least_busy"
         self.startup_timeout = float(
             os.environ.get("COMFYUI_MGPU_STARTUP_TIMEOUT", DEFAULT_STARTUP_TIMEOUT_SECONDS)
@@ -658,7 +726,7 @@ class MultiGpuOrchestrator:
 
     async def start(self) -> None:
         async with self._start_lock:
-            if self._started:
+            if self._started or self._closing:
                 return
             self._started = True
             await self._ensure_session()
@@ -672,6 +740,8 @@ class MultiGpuOrchestrator:
             self._comfy_args = self._load_comfy_args()
 
             for gpu_index in devices:
+                if self._closing:
+                    break
                 port = find_free_port()
                 worker = WorkerState(
                     gpu_index=gpu_index,
@@ -685,18 +755,36 @@ class MultiGpuOrchestrator:
             await asyncio.gather(*(self._wait_for_worker(worker) for worker in self.workers))
 
     async def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         for worker in self.workers:
             for task in worker.client_bridge_tasks.values():
                 task.cancel()
-            if worker.process and worker.process.poll() is None:
-                worker.process.terminate()
+            worker.status = "stopped"
+            worker.running = 0
+            worker.pending = 0
+        await asyncio.gather(*(self._terminate_worker_process(worker) for worker in self.workers))
         if self._session:
             await self._session.close()
+            self._session = None
 
     def close_sync(self) -> None:
+        self._closing = True
         for worker in self.workers:
+            worker.status = "stopped"
+            worker.running = 0
+            worker.pending = 0
             if worker.process and worker.process.poll() is None:
-                worker.process.terminate()
+                try:
+                    worker.process.terminate()
+                except Exception:
+                    logging.debug(
+                        "%s Failed to terminate worker for GPU %s during shutdown",
+                        LOG_PREFIX,
+                        worker.gpu_index,
+                        exc_info=True,
+                    )
 
     def _worker_for_gpu(self, gpu_index: int) -> WorkerState | None:
         for worker in self.workers:
@@ -767,7 +855,12 @@ class MultiGpuOrchestrator:
                 process.returncode,
                 f"; see {worker.log_path}" if worker.log_path else "",
             )
-        if worker.status != "stopped" and self.auto_respawn and not worker.respawn_blocked:
+        if (
+            worker.status != "stopped"
+            and not self._closing
+            and self.auto_respawn
+            and not worker.respawn_blocked
+        ):
             await self._respawn_worker(worker)
         return True
 
@@ -804,10 +897,11 @@ class MultiGpuOrchestrator:
         worker.respawning = True
         pending_count = len(worker.pending_prompt_payloads)
         logging.warning(
-            "%s Respawning worker for GPU %s with %s tracked pending job(s)",
+            "%s Respawning worker for GPU %s with %s tracked pending job(s)%s",
             LOG_PREFIX,
             worker.gpu_index,
             pending_count,
+            "" if self.requeue_pending_on_respawn else "; pending-job requeue is disabled",
         )
         try:
             await self._terminate_worker_process(worker)
@@ -818,7 +912,10 @@ class MultiGpuOrchestrator:
                 return False
             worker.respawn_blocked = False
             if pending_count:
-                await self._requeue_worker_pending_prompts(worker)
+                if self.requeue_pending_on_respawn:
+                    await self._requeue_worker_pending_prompts(worker)
+                else:
+                    self._discard_worker_pending_prompts(worker)
                 await self.refresh_worker_queue(worker)
             return True
         finally:
@@ -868,9 +965,12 @@ class MultiGpuOrchestrator:
             config["auto_start"] = bool(payload["auto_start"])
         if "auto_respawn" in payload:
             config["auto_respawn"] = bool(payload["auto_respawn"])
+        if "requeue_pending_on_respawn" in payload:
+            config["requeue_pending_on_respawn"] = bool(payload["requeue_pending_on_respawn"])
         self.config = save_config(config)
         self.auto_start = bool(self.config.get("auto_start", True))
         self.auto_respawn = bool(self.config.get("auto_respawn", True))
+        self.requeue_pending_on_respawn = bool(self.config.get("requeue_pending_on_respawn", True))
         return self.config
 
     def _spawn_worker(self, worker: WorkerState, comfy_args: Any) -> None:
@@ -882,6 +982,7 @@ class MultiGpuOrchestrator:
         )
         env = os.environ.copy()
         env[WORKER_ENV_FLAG] = "1"
+        env[PARENT_PID_ENV] = str(os.getpid())
         stdout_target: Any = subprocess.DEVNULL
         stderr_target: Any = subprocess.DEVNULL
         try:
@@ -988,8 +1089,7 @@ class MultiGpuOrchestrator:
             return
         try:
             data = await self._fetch_worker_json(worker, "/queue")
-            worker.running = len(data.get("queue_running", []))
-            worker.pending = len(data.get("queue_pending", []))
+            self._apply_worker_queue_snapshot(worker, data)
             worker.status = "healthy"
             worker.error = None
             worker.last_seen = time.time()
@@ -1121,6 +1221,54 @@ class MultiGpuOrchestrator:
         prompt_id = str(prompt_id)
         worker.accepted_prompt_ids.discard(prompt_id)
         worker.pending_prompt_payloads.pop(prompt_id, None)
+
+    @staticmethod
+    def _queue_prompt_ids(data: Any) -> set[str] | None:
+        if not isinstance(data, dict):
+            return None
+        queue_lists = []
+        for key in ("queue_running", "queue_pending"):
+            items = data.get(key)
+            if not isinstance(items, list):
+                return None
+            queue_lists.append(items)
+        return {
+            str(item[1])
+            for items in queue_lists
+            for item in items
+            if isinstance(item, (list, tuple)) and len(item) > 1 and item[1] is not None
+        }
+
+    def _apply_worker_queue_snapshot(self, worker: WorkerState, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        running = data.get("queue_running")
+        pending = data.get("queue_pending")
+        if isinstance(running, list):
+            worker.running = len(running)
+        if isinstance(pending, list):
+            worker.pending = len(pending)
+        active_prompt_ids = self._queue_prompt_ids(data)
+        if active_prompt_ids is None or worker.respawning:
+            return
+        completed_prompt_ids = set(worker.pending_prompt_payloads) - active_prompt_ids
+        for prompt_id in completed_prompt_ids:
+            worker.pending_prompt_payloads.pop(prompt_id, None)
+            worker.accepted_prompt_ids.discard(prompt_id)
+
+    def _discard_worker_pending_prompts(self, worker: WorkerState) -> None:
+        discarded_prompt_ids = set(worker.pending_prompt_payloads)
+        worker.pending_prompt_payloads.clear()
+        worker.accepted_prompt_ids.clear()
+        for prompt_id in discarded_prompt_ids:
+            if self.prompt_to_worker.get(prompt_id) is worker:
+                self.prompt_to_worker.pop(prompt_id, None)
+        logging.info(
+            "%s Discarded %s pending prompt(s) from GPU %s after respawn",
+            LOG_PREFIX,
+            len(discarded_prompt_ids),
+            worker.gpu_index,
+        )
 
     async def _requeue_worker_pending_prompts(self, worker: WorkerState) -> None:
         pending_payloads = list(worker.pending_prompt_payloads.items())
@@ -1390,6 +1538,7 @@ class MultiGpuOrchestrator:
         if not workers:
             return web.json_response({"workers": [], "error": "no workers available"}, status=424)
         result = await self._fanout_post(workers, "/interrupt", payload)
+        await asyncio.gather(*(self.refresh_worker_queue(worker) for worker in workers))
         status = 200 if any(item["ok"] for item in result) else 424
         return web.json_response({"workers": result}, status=status)
 
@@ -1645,6 +1794,7 @@ class MultiGpuOrchestrator:
         if not self.workers:
             return web.json_response({"workers": [], "error": "no workers available"}, status=424)
         result = await self._fanout_post(self.workers, "/queue", payload)
+        await self.refresh_queues()
         status = 200 if any(item["ok"] for item in result) else 424
         return web.json_response({"workers": result}, status=status)
 
@@ -1725,6 +1875,8 @@ class MultiGpuOrchestrator:
             try:
                 payload = await self._fetch_worker_json_with_query(worker, route, query)
                 if isinstance(payload, dict):
+                    if route == "/queue":
+                        self._apply_worker_queue_snapshot(worker, payload)
                     payloads.append(payload)
                     worker.status = "healthy"
                     worker.error = None
@@ -1765,6 +1917,7 @@ class MultiGpuOrchestrator:
                 "enabled": True,
                 "auto_start": self.auto_start,
                 "auto_respawn": self.auto_respawn,
+                "requeue_pending_on_respawn": self.requeue_pending_on_respawn,
                 "started": self._started,
                 "worker_mode": os.environ.get(WORKER_ENV_FLAG) == "1",
                 "routing_policy": self.routing_policy,
@@ -1855,6 +2008,11 @@ def register_routes() -> MultiGpuOrchestrator | None:
     @routes.post("/mgpu/settings")
     async def mgpu_settings_update(request):
         return await orchestrator.settings_update_response(request)
+
+    async def close_workers_with_primary(_app):
+        await orchestrator.close()
+
+    prompt_server.app.on_shutdown.append(close_workers_with_primary)
 
     @routes.post("/mgpu/workers/{gpu_index}/stop")
     async def mgpu_worker_stop(request):
