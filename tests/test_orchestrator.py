@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 from orchestrator import (  # noqa: E402
     PARENT_PID_ENV,
     MultiGpuOrchestrator,
+    WorkerCgroup,
     WorkerState,
     aggregate_assets_payload,
     aggregate_jobs_payload,
@@ -23,8 +24,12 @@ from orchestrator import (  # noqa: E402
     build_queue_info,
     build_worker_command,
     create_direct_prompt_routing_middleware,
+    create_worker_cgroup,
+    default_worker_memory_limits,
+    effective_memory_capacity,
     load_config,
     parse_device_list,
+    parse_memory_limit,
     read_log_chunk,
     reset_worker_logs,
     route_with_query,
@@ -91,6 +96,94 @@ class OrchestratorPureTests(unittest.TestCase):
         self.assertIn("--extra-model-paths-config", command)
         self.assertIn("/comfy/extra.yaml", command)
         self.assertIn("--enable-assets", command)
+
+    def test_memory_limits_accept_percentages_and_binary_units(self):
+        reference = 8 * 1024**3
+
+        self.assertEqual(parse_memory_limit("75%", reference), 6 * 1024**3)
+        self.assertEqual(parse_memory_limit("1.5GiB"), int(1.5 * 1024**3))
+        self.assertIsNone(parse_memory_limit("max"))
+        with self.assertRaises(ValueError):
+            parse_memory_limit("101%", reference)
+
+    def test_effective_memory_capacity_honors_parent_cgroup_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            meminfo = root / "meminfo"
+            meminfo.write_text(
+                "MemTotal:       16777216 kB\nMemAvailable:   12582912 kB\n",
+                encoding="ascii",
+            )
+            cgroup = root / "cgroup"
+            cgroup.mkdir()
+            (cgroup / "memory.max").write_text(str(8 * 1024**3), encoding="ascii")
+            (cgroup / "memory.current").write_text(str(2 * 1024**3), encoding="ascii")
+
+            self.assertEqual(
+                effective_memory_capacity(cgroup, meminfo),
+                (8 * 1024**3, 6 * 1024**3),
+            )
+
+    def test_default_worker_limits_reserve_headroom_and_reclaim_before_max(self):
+        total = 64 * 1024**3
+        available = 60 * 1024**3
+
+        memory_high, memory_max = default_worker_memory_limits(total, available)
+
+        self.assertLess(memory_high, memory_max)
+        self.assertLess(memory_max, available)
+        self.assertGreaterEqual(available - memory_max, int(total * 0.15))
+
+    def test_worker_cgroup_wraps_commands_with_shared_pre_exec_move(self):
+        cgroup = WorkerCgroup(
+            path=Path("/sys/fs/cgroup/comfyui-workers"),
+            memory_high=1024**3,
+            memory_max=2 * 1024**3,
+            parent_path=Path("/sys/fs/cgroup"),
+        )
+
+        wrapped = cgroup.wrap_command(["/python", "/comfy/main.py"])
+
+        self.assertEqual(wrapped[:2], ["/bin/sh", "-c"])
+        self.assertIn("cgroup.procs", wrapped[2])
+        self.assertEqual(wrapped[-3:], [str(cgroup.path), "/python", "/comfy/main.py"])
+
+    def test_create_worker_cgroup_sets_aggregate_high_and_max(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / "delegated"
+            parent.mkdir()
+            (parent / "cgroup.controllers").write_text("memory cpu", encoding="ascii")
+            (parent / "cgroup.subtree_control").write_text("memory", encoding="ascii")
+            environment = {
+                "COMFYUI_MGPU_CGROUP": "auto",
+                "COMFYUI_MGPU_CGROUP_ROOT": tmpdir,
+                "COMFYUI_MGPU_CGROUP_MEMORY_HIGH": "50%",
+                "COMFYUI_MGPU_CGROUP_MEMORY_MAX": "75%",
+            }
+
+            with (
+                patch.dict(os.environ, environment),
+                patch("orchestrator.sys.platform", "linux"),
+                patch("orchestrator._current_cgroup_path", return_value=parent),
+                patch(
+                    "orchestrator.effective_memory_capacity",
+                    return_value=(8 * 1024**3, 8 * 1024**3),
+                ),
+            ):
+                cgroup = create_worker_cgroup()
+
+            self.assertIsNotNone(cgroup)
+            self.assertEqual(cgroup.path.parent, parent)
+            self.assertEqual(cgroup.memory_high, 4 * 1024**3)
+            self.assertEqual(cgroup.memory_max, 6 * 1024**3)
+            self.assertEqual(
+                (cgroup.path / "memory.high").read_text(encoding="ascii"),
+                str(4 * 1024**3),
+            )
+            self.assertEqual(
+                (cgroup.path / "memory.max").read_text(encoding="ascii"),
+                str(6 * 1024**3),
+            )
 
     def test_worker_log_path_is_stable_per_gpu(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -725,6 +818,26 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
             orchestrator._spawn_worker(worker, None)
 
         self.assertEqual(popen.call_args.kwargs["env"][PARENT_PID_ENV], str(os.getpid()))
+
+    async def test_spawned_workers_enter_the_shared_memory_cgroup_before_exec(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        orchestrator.worker_cgroup = WorkerCgroup(
+            path=Path("/sys/fs/cgroup/comfyui-workers"),
+            memory_high=1024**3,
+            memory_max=2 * 1024**3,
+            parent_path=Path("/sys/fs/cgroup"),
+        )
+        worker = WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000")
+        process = FakeProcess(returncode=None)
+        process.stdout = None
+
+        with patch("orchestrator.subprocess.Popen", return_value=process) as popen:
+            orchestrator._spawn_worker(worker, None)
+
+        launch_command = popen.call_args.args[0]
+        self.assertEqual(launch_command[:2], ["/bin/sh", "-c"])
+        self.assertIn(str(orchestrator.worker_cgroup.path), launch_command)
+        self.assertIn(str(orchestrator.comfy_root / "main.py"), launch_command)
 
     async def test_failed_auto_respawn_is_blocked_until_manual_restart(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())

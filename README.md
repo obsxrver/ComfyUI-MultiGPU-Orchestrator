@@ -37,6 +37,31 @@ worker's last queue snapshot. Completed jobs are removed from the replay ledger.
 Workers also stop when the primary ComfyUI server shuts down, restarts, or exits
 unexpectedly.
 
+### Worker RAM containment on Linux
+
+On cgroup-v2 Linux hosts, all GPU workers are launched in one shared memory
+cgroup. The aggregate limit covers anonymous memory and filesystem page cache,
+so several workers loading the same or different models cannot independently
+consume all available system RAM. By default, reclaim pressure starts before a
+hard cap, while reserving at least 15% of effective system/container RAM (and at
+least 4 GiB when enough RAM is available) for the main ComfyUI process and the
+host.
+
+The cgroup hierarchy must be writable or delegated to the ComfyUI process. If it
+is not, the orchestrator logs a warning and launches workers without a RAM limit.
+The active cgroup path and limits are also returned by `GET /mgpu/status`.
+
+The automatic thresholds can be overridden with values such as `80%`, `48GiB`,
+or a byte count:
+
+```bash
+export COMFYUI_MGPU_CGROUP_MEMORY_HIGH=48GiB
+export COMFYUI_MGPU_CGROUP_MEMORY_MAX=56GiB
+```
+
+Set `COMFYUI_MGPU_CGROUP=0` to explicitly disable containment. Setting either
+limit to `max` disables that threshold.
+
 ## Install
 
 Clone this repository into `ComfyUI/custom_nodes/`:

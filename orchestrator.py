@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -29,9 +30,18 @@ PARENT_PID_ENV = "COMFYUI_MGPU_PARENT_PID"
 CONFIG_PATH_ENV = "COMFYUI_MGPU_CONFIG"
 CONFIG_FILE_NAME = "mgpu_config.json"
 LOG_DIR_ENV = "COMFYUI_MGPU_LOG_DIR"
+CGROUP_MODE_ENV = "COMFYUI_MGPU_CGROUP"
+CGROUP_ROOT_ENV = "COMFYUI_MGPU_CGROUP_ROOT"
+CGROUP_MEMORY_HIGH_ENV = "COMFYUI_MGPU_CGROUP_MEMORY_HIGH"
+CGROUP_MEMORY_MAX_ENV = "COMFYUI_MGPU_CGROUP_MEMORY_MAX"
 WORKER_LOG_READ_LIMIT = 256 * 1024
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_JOBS_FETCH_LIMIT = 1000
+MIN_CGROUP_MEMORY_BYTES = 64 * 1024 * 1024
+DEFAULT_CGROUP_RESERVED_BYTES = 4 * 1024**3
+DEFAULT_CGROUP_RESERVED_RATIO = 0.15
+DEFAULT_CGROUP_RECLAIM_GAP_BYTES = 1024**3
+DEFAULT_CGROUP_RECLAIM_GAP_RATIO = 0.05
 ADDRESS_IN_USE_MARKERS = (
     "address already in use",
     "address is already in use",
@@ -62,6 +72,248 @@ FORWARDED_WS_TYPES = {
 }
 DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
 _PARENT_WATCHDOG_STARTED = False
+
+
+@dataclass
+class WorkerCgroup:
+    path: Path
+    memory_high: int | None
+    memory_max: int | None
+    parent_path: Path
+    primary_path: Path | None = None
+    enabled_memory_controller: bool = False
+
+    def wrap_command(self, command: list[str]) -> list[str]:
+        # The small launcher moves itself before exec, avoiding the race where
+        # ComfyUI starts allocating memory before the parent can move its PID.
+        launcher = (
+            'cgroup_path=$1; shift; '
+            'printf "%s\\n" "$$" > "$cgroup_path/cgroup.procs" || exit 125; '
+            'exec "$@"'
+        )
+        return ["/bin/sh", "-c", launcher, "comfyui-mgpu-cgroup", str(self.path), *command]
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "path": str(self.path),
+            "memory_high": self.memory_high,
+            "memory_max": self.memory_max,
+        }
+
+    def cleanup(self) -> bool:
+        try:
+            self.path.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logging.debug("%s Worker cgroup %s is still populated", LOG_PREFIX, self.path)
+            return False
+
+        if self.primary_path is None:
+            if self.enabled_memory_controller:
+                try:
+                    (self.parent_path / "cgroup.subtree_control").write_text("-memory", encoding="ascii")
+                except OSError:
+                    logging.debug("%s Unable to restore cgroup controllers", LOG_PREFIX, exc_info=True)
+            return True
+        try:
+            if self.enabled_memory_controller:
+                (self.parent_path / "cgroup.subtree_control").write_text("-memory", encoding="ascii")
+            (self.parent_path / "cgroup.procs").write_text(str(os.getpid()), encoding="ascii")
+            self.primary_path.rmdir()
+        except OSError:
+            logging.debug("%s Unable to collapse temporary cgroup hierarchy", LOG_PREFIX, exc_info=True)
+            return False
+        return True
+
+
+def parse_memory_limit(value: str, reference_bytes: int | None = None) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"max", "none", "unlimited"}:
+        return None
+    if normalized.endswith("%"):
+        if reference_bytes is None:
+            raise ValueError("percentage memory limits require a detected memory capacity")
+        try:
+            ratio = float(normalized[:-1]) / 100.0
+        except ValueError as exc:
+            raise ValueError(f"invalid memory limit: {value!r}") from exc
+        if not 0 < ratio <= 1:
+            raise ValueError(f"memory limit percentage must be greater than 0 and at most 100: {value!r}")
+        return int(reference_bytes * ratio)
+
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?i?b?)?", normalized)
+    if match is None:
+        raise ValueError(f"invalid memory limit: {value!r}")
+    unit = (match.group(2) or "b").removesuffix("b").removesuffix("i")
+    powers = {"": 0, "k": 1, "m": 2, "g": 3, "t": 4, "p": 5, "e": 6}
+    parsed = int(float(match.group(1)) * (1024 ** powers[unit]))
+    if parsed < MIN_CGROUP_MEMORY_BYTES:
+        raise ValueError(f"memory limit must be at least {MIN_CGROUP_MEMORY_BYTES} bytes")
+    return parsed
+
+
+def _read_meminfo(meminfo_path: Path = Path("/proc/meminfo")) -> tuple[int, int]:
+    values: dict[str, int] = {}
+    for line in meminfo_path.read_text(encoding="ascii").splitlines():
+        key, separator, remainder = line.partition(":")
+        if separator and key in {"MemTotal", "MemAvailable"}:
+            values[key] = int(remainder.strip().split()[0]) * 1024
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable", total)
+    if total <= 0 or available <= 0:
+        raise RuntimeError("unable to determine available system memory")
+    return total, min(available, total)
+
+
+def _read_cgroup_limit(path: Path) -> int | None:
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    if not value or value == "max":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def effective_memory_capacity(
+    cgroup_path: Path,
+    meminfo_path: Path = Path("/proc/meminfo"),
+) -> tuple[int, int]:
+    total, available = _read_meminfo(meminfo_path)
+    parent_max = _read_cgroup_limit(cgroup_path / "memory.max")
+    if parent_max is None:
+        return total, available
+    parent_current = _read_cgroup_limit(cgroup_path / "memory.current") or 0
+    effective_total = min(total, parent_max)
+    effective_available = min(available, max(parent_max - parent_current, 0))
+    if effective_available <= 0:
+        raise RuntimeError("the parent cgroup has no memory available for workers")
+    return effective_total, effective_available
+
+
+def default_worker_memory_limits(total_bytes: int, available_bytes: int) -> tuple[int, int]:
+    reserved = max(DEFAULT_CGROUP_RESERVED_BYTES, int(total_bytes * DEFAULT_CGROUP_RESERVED_RATIO))
+    reserved = min(reserved, available_bytes // 2)
+    memory_max = max(available_bytes - reserved, MIN_CGROUP_MEMORY_BYTES)
+    reclaim_gap = max(DEFAULT_CGROUP_RECLAIM_GAP_BYTES, int(total_bytes * DEFAULT_CGROUP_RECLAIM_GAP_RATIO))
+    reclaim_gap = min(reclaim_gap, memory_max // 4)
+    memory_high = max(memory_max - reclaim_gap, MIN_CGROUP_MEMORY_BYTES)
+    return memory_high, memory_max
+
+
+def _current_cgroup_path(cgroup_root: Path, proc_cgroup_path: Path = Path("/proc/self/cgroup")) -> Path:
+    for line in proc_cgroup_path.read_text(encoding="ascii").splitlines():
+        hierarchy, separator, remainder = line.partition(":")
+        controllers, second_separator, relative = remainder.partition(":")
+        if hierarchy == "0" and separator and second_separator and controllers == "":
+            parts = [part for part in relative.strip().split("/") if part]
+            return cgroup_root.joinpath(*parts)
+    raise RuntimeError("the process is not running in a cgroup-v2 hierarchy")
+
+
+def create_worker_cgroup() -> WorkerCgroup | None:
+    mode = os.environ.get(CGROUP_MODE_ENV, "auto").strip().lower()
+    if mode in {"0", "false", "no", "off", "disabled"}:
+        return None
+    if not sys.platform.startswith("linux"):
+        return None
+
+    cgroup_root = Path(os.environ.get(CGROUP_ROOT_ENV, "/sys/fs/cgroup"))
+    parent_path = _current_cgroup_path(cgroup_root)
+    controllers = set((parent_path / "cgroup.controllers").read_text(encoding="ascii").split())
+    if "memory" not in controllers:
+        raise RuntimeError("the cgroup-v2 memory controller is not available")
+
+    total_bytes, available_bytes = effective_memory_capacity(parent_path)
+    default_high, default_max = default_worker_memory_limits(total_bytes, available_bytes)
+    high_value = os.environ.get(CGROUP_MEMORY_HIGH_ENV)
+    max_value = os.environ.get(CGROUP_MEMORY_MAX_ENV)
+    memory_high = parse_memory_limit(high_value, available_bytes) if high_value else default_high
+    memory_max = parse_memory_limit(max_value, available_bytes) if max_value else default_max
+    if memory_high is not None and memory_max is not None and memory_high > memory_max:
+        if high_value and not max_value:
+            memory_max = memory_high
+        elif max_value and not high_value:
+            memory_high = memory_max
+        else:
+            raise ValueError(f"{CGROUP_MEMORY_HIGH_ENV} cannot exceed {CGROUP_MEMORY_MAX_ENV}")
+
+    suffix = f"{os.getpid()}-{time.time_ns()}"
+    worker_path = parent_path / f"comfyui-mgpu-workers-{suffix}"
+    primary_path: Path | None = None
+    enabled_memory_controller = False
+    subtree_control = parent_path / "cgroup.subtree_control"
+    enabled_controllers = set(subtree_control.read_text(encoding="ascii").split())
+
+    try:
+        if "memory" not in enabled_controllers:
+            if parent_path == cgroup_root:
+                subtree_control.write_text("+memory", encoding="ascii")
+            else:
+                current_pids = {
+                    int(pid)
+                    for pid in (parent_path / "cgroup.procs").read_text(encoding="ascii").split()
+                    if pid.isdigit()
+                }
+                if current_pids != {os.getpid()}:
+                    raise RuntimeError(
+                        "the current cgroup is not delegated and contains processes besides ComfyUI"
+                    )
+                primary_path = parent_path / f"comfyui-mgpu-primary-{suffix}"
+                primary_path.mkdir()
+                (primary_path / "cgroup.procs").write_text(str(os.getpid()), encoding="ascii")
+                try:
+                    subtree_control.write_text("+memory", encoding="ascii")
+                except Exception:
+                    (parent_path / "cgroup.procs").write_text(str(os.getpid()), encoding="ascii")
+                    primary_path.rmdir()
+                    primary_path = None
+                    raise
+            enabled_memory_controller = True
+
+        worker_path.mkdir()
+        (worker_path / "memory.max").write_text(
+            "max" if memory_max is None else str(memory_max),
+            encoding="ascii",
+        )
+        (worker_path / "memory.high").write_text(
+            "max" if memory_high is None else str(memory_high),
+            encoding="ascii",
+        )
+    except Exception:
+        try:
+            worker_path.rmdir()
+        except OSError:
+            pass
+        if primary_path is not None:
+            try:
+                if enabled_memory_controller:
+                    subtree_control.write_text("-memory", encoding="ascii")
+                (parent_path / "cgroup.procs").write_text(str(os.getpid()), encoding="ascii")
+                primary_path.rmdir()
+            except OSError:
+                logging.debug("%s Unable to roll back cgroup setup", LOG_PREFIX, exc_info=True)
+        elif enabled_memory_controller:
+            try:
+                subtree_control.write_text("-memory", encoding="ascii")
+            except OSError:
+                logging.debug("%s Unable to restore cgroup controllers", LOG_PREFIX, exc_info=True)
+        raise
+
+    return WorkerCgroup(
+        path=worker_path,
+        memory_high=memory_high,
+        memory_max=memory_max,
+        parent_path=parent_path,
+        primary_path=primary_path,
+        enabled_memory_controller=enabled_memory_controller,
+    )
 
 
 def _parent_process_is_alive(parent_pid: int) -> bool:
@@ -699,6 +951,9 @@ class MultiGpuOrchestrator:
         self._started = False
         self._closing = False
         self._start_lock = asyncio.Lock()
+        self._worker_cgroup_initialized = False
+        self.worker_cgroup: WorkerCgroup | None = None
+        self.worker_cgroup_error: str | None = None
         self._comfy_args: Any = None
         self.log_session_id = str(time.time_ns())
         self.config = load_config()
@@ -724,6 +979,38 @@ class MultiGpuOrchestrator:
             timeout = aiohttp.ClientTimeout(total=None)
             self._session = aiohttp.ClientSession(timeout=timeout)
 
+    def _initialize_worker_cgroup(self) -> None:
+        if self._worker_cgroup_initialized:
+            return
+        self._worker_cgroup_initialized = True
+        try:
+            self.worker_cgroup = create_worker_cgroup()
+        except Exception as exc:
+            self.worker_cgroup_error = str(exc)
+            logging.warning(
+                "%s Unable to create the shared worker memory cgroup; workers will be unbounded: %s",
+                LOG_PREFIX,
+                exc,
+            )
+            return
+        if self.worker_cgroup is None:
+            if sys.platform.startswith("linux"):
+                self.worker_cgroup_error = "disabled by configuration"
+            else:
+                self.worker_cgroup_error = "cgroup v2 is only available on Linux"
+            return
+        logging.info(
+            "%s Worker cgroup ready at %s (memory.high=%s, memory.max=%s)",
+            LOG_PREFIX,
+            self.worker_cgroup.path,
+            self.worker_cgroup.memory_high if self.worker_cgroup.memory_high is not None else "max",
+            self.worker_cgroup.memory_max if self.worker_cgroup.memory_max is not None else "max",
+        )
+
+    def _cleanup_worker_cgroup(self) -> None:
+        if self.worker_cgroup is not None and self.worker_cgroup.cleanup():
+            self.worker_cgroup = None
+
     async def start(self) -> None:
         async with self._start_lock:
             if self._started or self._closing:
@@ -737,6 +1024,7 @@ class MultiGpuOrchestrator:
                 logging.warning("%s No CUDA devices found; UI will fall back to native /prompt", LOG_PREFIX)
                 return
 
+            self._initialize_worker_cgroup()
             self._comfy_args = self._load_comfy_args()
 
             for gpu_index in devices:
@@ -765,6 +1053,7 @@ class MultiGpuOrchestrator:
             worker.running = 0
             worker.pending = 0
         await asyncio.gather(*(self._terminate_worker_process(worker) for worker in self.workers))
+        self._cleanup_worker_cgroup()
         if self._session:
             await self._session.close()
             self._session = None
@@ -821,6 +1110,9 @@ class MultiGpuOrchestrator:
                 await asyncio.sleep(0.1)
             if process.poll() is None:
                 process.kill()
+                deadline = time.monotonic() + 2
+                while process.poll() is None and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
         worker.process = None
 
     def _worker_log_tail(self, worker: WorkerState, max_bytes: int = 32768) -> str:
@@ -988,8 +1280,9 @@ class MultiGpuOrchestrator:
         try:
             stdout_target = subprocess.PIPE
             stderr_target = subprocess.STDOUT
+            launch_command = self.worker_cgroup.wrap_command(command) if self.worker_cgroup else command
             worker.process = subprocess.Popen(
-                command,
+                launch_command,
                 cwd=str(self.comfy_root),
                 env=env,
                 stdout=stdout_target,
@@ -1010,7 +1303,9 @@ class MultiGpuOrchestrator:
                     worker.log_path = str(log_path)
                     header = (
                         f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting worker GPU {worker.gpu_index} "
-                        f"(pid={worker.process.pid}): {' '.join(command)}\n"
+                        f"(pid={worker.process.pid}"
+                        f"{f', cgroup={self.worker_cgroup.path}' if self.worker_cgroup else ''}): "
+                        f"{' '.join(command)}\n"
                     )
                     threading.Thread(
                         target=_write_worker_output_to_log,
@@ -1921,6 +2216,11 @@ class MultiGpuOrchestrator:
                 "started": self._started,
                 "worker_mode": os.environ.get(WORKER_ENV_FLAG) == "1",
                 "routing_policy": self.routing_policy,
+                "worker_cgroup": (
+                    self.worker_cgroup.public_dict()
+                    if self.worker_cgroup is not None
+                    else {"enabled": False, "error": self.worker_cgroup_error}
+                ),
                 "workers": [worker.public_dict() for worker in self.workers],
             }
         )
