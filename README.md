@@ -37,30 +37,49 @@ worker's last queue snapshot. Completed jobs are removed from the replay ledger.
 Workers also stop when the primary ComfyUI server shuts down, restarts, or exits
 unexpectedly.
 
-### Worker RAM containment on Linux
+### Aggregate worker RAM accounting
 
-On cgroup-v2 Linux hosts, all GPU workers are launched in one shared memory
-cgroup. The aggregate limit covers anonymous memory and filesystem page cache,
-so several workers loading the same or different models cannot independently
-consume all available system RAM. By default, reclaim pressure starts before a
-hard cap, while reserving at least 15% of effective system/container RAM (and at
-least 4 GiB when enough RAM is available) for the main ComfyUI process and the
-host.
+Workers use the outer container's read-only cgroup-v2 counters to make ComfyUI
+container-aware. ComfyUI normally asks `psutil` for host-wide RAM, which can be
+much larger than a Vast.ai instance's allocation. In worker processes, the
+orchestrator reports the smaller allocation and its aggregate remaining memory
+to ComfyUI's existing RAM-pressure cache, model offload, and pinned-memory
+logic. Caching stays enabled, but every worker reacts to the combined memory
+used by the primary process and all workers.
 
-The cgroup hierarchy must be writable or delegated to the ComfyUI process. If it
-is not, the orchestrator logs a warning and launches workers without a RAM limit.
-The active cgroup path and limits are also returned by `GET /mgpu/status`.
+When aggregate headroom falls below ComfyUI's normal RAM-pressure target, the
+orchestrator also asks idle workers to release retained models and intermediate
+outputs, and temporarily queues new work behind an already-active worker rather
+than creating another model copy. This is pressure-triggered reclamation, not a
+cache-disable flag; workers cache normally again as soon as pressure subsides.
 
-The automatic thresholds can be overridden with values such as `80%`, `48GiB`,
-or a byte count:
+On Vast.ai, the orchestrator reads the instance allocation from the official
+instance API using the injected per-instance credentials. If that is
+unavailable, it uses the existing `memory.high`/`memory.max` values. The
+aggregate pinned-memory allowance is divided across workers so each process
+cannot independently reserve a full-instance allowance.
+
+If the host delegates a writable cgroup hierarchy, the orchestrator also adds a
+kernel-enforced shared worker cgroup. Read-only container cgroups do not prevent
+the accounting-based path from working. Memory accounting and cgroup details
+are returned by `GET /mgpu/status`.
+
+On a read-only hierarchy this is cooperative pressure control inside ComfyUI,
+not a kernel hard cap; an exact hard ceiling still requires the container host
+to delegate a memory controller. The fallback is designed to reclaim before the
+outer runtime reaches that ceiling.
+
+The detected aggregate allocation can be overridden with values such as `80%`,
+`48GiB`, or a byte count:
 
 ```bash
-export COMFYUI_MGPU_CGROUP_MEMORY_HIGH=48GiB
-export COMFYUI_MGPU_CGROUP_MEMORY_MAX=56GiB
+export COMFYUI_MGPU_SYSTEM_RAM_LIMIT=56GiB
 ```
 
-Set `COMFYUI_MGPU_CGROUP=0` to explicitly disable containment. Setting either
-limit to `max` disables that threshold.
+The writable-cgroup thresholds remain independently configurable through
+`COMFYUI_MGPU_CGROUP_MEMORY_HIGH` and `COMFYUI_MGPU_CGROUP_MEMORY_MAX`. Set
+`COMFYUI_MGPU_CGROUP=0` to skip the writable-cgroup attempt while retaining
+aggregate accounting.
 
 ## Install
 

@@ -27,6 +27,8 @@ except Exception:  # pragma: no cover - ComfyUI provides aiohttp at runtime.
 LOG_PREFIX = "[ComfyUI-MGPU]"
 WORKER_ENV_FLAG = "COMFYUI_MGPU_WORKER"
 PARENT_PID_ENV = "COMFYUI_MGPU_PARENT_PID"
+WORKER_COUNT_ENV = "COMFYUI_MGPU_WORKER_COUNT"
+SYSTEM_RAM_LIMIT_ENV = "COMFYUI_MGPU_SYSTEM_RAM_LIMIT"
 CONFIG_PATH_ENV = "COMFYUI_MGPU_CONFIG"
 CONFIG_FILE_NAME = "mgpu_config.json"
 LOG_DIR_ENV = "COMFYUI_MGPU_LOG_DIR"
@@ -42,6 +44,11 @@ DEFAULT_CGROUP_RESERVED_BYTES = 4 * 1024**3
 DEFAULT_CGROUP_RESERVED_RATIO = 0.15
 DEFAULT_CGROUP_RECLAIM_GAP_BYTES = 1024**3
 DEFAULT_CGROUP_RECLAIM_GAP_RATIO = 0.05
+MIN_RAM_HEADROOM_BYTES = 2 * 1024**3
+MAX_RAM_HEADROOM_BYTES = 10 * 1024**3
+RAM_HEADROOM_RATIO = 0.10
+MEMORY_PRESSURE_POLL_SECONDS = 1.0
+MEMORY_RECLAIM_COOLDOWN_SECONDS = 10.0
 ADDRESS_IN_USE_MARKERS = (
     "address already in use",
     "address is already in use",
@@ -205,6 +212,28 @@ def default_worker_memory_limits(total_bytes: int, available_bytes: int) -> tupl
     reclaim_gap = min(reclaim_gap, memory_max // 4)
     memory_high = max(memory_max - reclaim_gap, MIN_CGROUP_MEMORY_BYTES)
     return memory_high, memory_max
+
+
+def vast_instance_memory_limit(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    instance = payload.get("instances", payload)
+    if not isinstance(instance, dict):
+        return None
+    try:
+        memory_limit_gb = float(instance.get("mem_limit") or 0)
+    except (TypeError, ValueError):
+        memory_limit_gb = 0
+    if memory_limit_gb > 0:
+        return int(memory_limit_gb * 1_000_000_000)
+    try:
+        host_memory_mib = float(instance.get("cpu_ram") or 0)
+        gpu_fraction = float(instance.get("gpu_frac") or 0)
+    except (TypeError, ValueError):
+        return None
+    if host_memory_mib <= 0 or not 0 < gpu_fraction <= 1:
+        return None
+    return int(host_memory_mib * gpu_fraction * 1_000_000)
 
 
 def _current_cgroup_path(cgroup_root: Path, proc_cgroup_path: Path = Path("/proc/self/cgroup")) -> Path:
@@ -952,6 +981,15 @@ class MultiGpuOrchestrator:
         self._closing = False
         self._start_lock = asyncio.Lock()
         self._worker_cgroup_initialized = False
+        self.worker_count = 0
+        self.worker_memory_limit: int | None = None
+        self.worker_memory_limit_source: str | None = None
+        self.worker_memory_accounting_source: Any = None
+        self._memory_pressure_task: asyncio.Task | None = None
+        self._last_memory_reclaim_at: float | None = None
+        self._last_memory_reclaim_monotonic: float | None = None
+        self._memory_reclaim_count = 0
+        self._last_memory_reclaim_workers: list[int] = []
         self.worker_cgroup: WorkerCgroup | None = None
         self.worker_cgroup_error: str | None = None
         self._comfy_args: Any = None
@@ -987,8 +1025,8 @@ class MultiGpuOrchestrator:
             self.worker_cgroup = create_worker_cgroup()
         except Exception as exc:
             self.worker_cgroup_error = str(exc)
-            logging.warning(
-                "%s Unable to create the shared worker memory cgroup; workers will be unbounded: %s",
+            logging.info(
+                "%s Writable worker cgroup unavailable; using read-only aggregate memory accounting: %s",
                 LOG_PREFIX,
                 exc,
             )
@@ -1005,6 +1043,170 @@ class MultiGpuOrchestrator:
             self.worker_cgroup.path,
             self.worker_cgroup.memory_high if self.worker_cgroup.memory_high is not None else "max",
             self.worker_cgroup.memory_max if self.worker_cgroup.memory_max is not None else "max",
+        )
+
+    async def _initialize_worker_memory_limit(self) -> None:
+        try:
+            import psutil
+
+            try:
+                from .memory_accounting import detect_memory_accounting_source
+            except ImportError:
+                from memory_accounting import detect_memory_accounting_source
+
+            host_total = int(psutil.virtual_memory().total)
+        except Exception:
+            detect_memory_accounting_source = None
+            host_total = 0
+
+        configured = os.environ.get(SYSTEM_RAM_LIMIT_ENV)
+        if configured:
+            self.worker_memory_limit_source = SYSTEM_RAM_LIMIT_ENV
+            if detect_memory_accounting_source is not None:
+                try:
+                    detected = detect_memory_accounting_source(
+                        host_total,
+                        configured_limit=configured,
+                    )
+                    if detected is not None:
+                        self.worker_memory_limit = detected.limit_bytes
+                        self.worker_memory_accounting_source = detected
+                except (OSError, ValueError) as exc:
+                    logging.warning("%s Invalid aggregate RAM limit: %s", LOG_PREFIX, exc)
+            return
+        container_id = os.environ.get("CONTAINER_ID")
+        container_api_key = os.environ.get("CONTAINER_API_KEY")
+        if container_id and container_api_key and self._session is not None:
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with self._session.get(
+                    f"https://console.vast.ai/api/v0/instances/{container_id}/",
+                    headers={"Authorization": f"Bearer {container_api_key}"},
+                    timeout=timeout,
+                ) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+                self.worker_memory_limit = vast_instance_memory_limit(payload)
+            except Exception as exc:
+                logging.info("%s Unable to query the Vast.ai instance RAM allocation: %s", LOG_PREFIX, exc)
+            if self.worker_memory_limit is not None:
+                self.worker_memory_limit_source = "vast.ai instance allocation"
+                if detect_memory_accounting_source is not None:
+                    try:
+                        detected = detect_memory_accounting_source(
+                            host_total,
+                            configured_limit=str(self.worker_memory_limit),
+                        )
+                    except (OSError, ValueError) as exc:
+                        logging.info("%s Unable to read aggregate cgroup usage: %s", LOG_PREFIX, exc)
+                    else:
+                        if detected is not None:
+                            self.worker_memory_accounting_source = detected
+                            self.worker_memory_limit = detected.limit_bytes
+                            if detected.source != SYSTEM_RAM_LIMIT_ENV:
+                                self.worker_memory_limit_source += f" constrained by {detected.source}"
+                logging.info(
+                    "%s Using Vast.ai aggregate RAM allocation %.2f GiB for worker memory accounting",
+                    LOG_PREFIX,
+                    self.worker_memory_limit / 1024**3,
+                )
+                return
+
+        detected = detect_memory_accounting_source(host_total) if detect_memory_accounting_source else None
+        if detected is not None:
+            self.worker_memory_limit = detected.limit_bytes
+            self.worker_memory_limit_source = detected.source
+            self.worker_memory_accounting_source = detected
+
+    def _worker_memory_accounting_status(self) -> dict[str, Any]:
+        current_bytes = None
+        if self.worker_memory_accounting_source is not None:
+            current_bytes = self.worker_memory_accounting_source.current_usage()
+        available_bytes = None
+        if current_bytes is not None and self.worker_memory_limit is not None:
+            available_bytes = max(self.worker_memory_limit - current_bytes, 0)
+        return {
+            "enabled": self.worker_memory_accounting_source is not None,
+            "source": self.worker_memory_limit_source,
+            "limit_bytes": self.worker_memory_limit,
+            "current_bytes": current_bytes,
+            "available_bytes": available_bytes,
+            "target_headroom_bytes": self._memory_headroom_bytes(),
+            "under_pressure": self._memory_is_under_pressure(current_bytes),
+            "reclaim_count": self._memory_reclaim_count,
+            "last_reclaim_at": self._last_memory_reclaim_at,
+            "last_reclaim_workers": self._last_memory_reclaim_workers,
+        }
+
+    def _memory_headroom_bytes(self) -> int | None:
+        if self.worker_memory_limit is None:
+            return None
+        requested = max(MIN_RAM_HEADROOM_BYTES, int(self.worker_memory_limit * RAM_HEADROOM_RATIO))
+        return min(self.worker_memory_limit, MAX_RAM_HEADROOM_BYTES, requested)
+
+    def _memory_is_under_pressure(self, current_bytes: int | None = None) -> bool:
+        if self.worker_memory_accounting_source is None or self.worker_memory_limit is None:
+            return False
+        if current_bytes is None:
+            current_bytes = self.worker_memory_accounting_source.current_usage()
+        headroom = self._memory_headroom_bytes()
+        return current_bytes is not None and headroom is not None and current_bytes > self.worker_memory_limit - headroom
+
+    async def _reclaim_idle_worker_memory(self) -> bool:
+        if not self._memory_is_under_pressure():
+            return False
+        now = time.monotonic()
+        if self._last_memory_reclaim_monotonic is not None:
+            elapsed = now - self._last_memory_reclaim_monotonic
+            if elapsed < MEMORY_RECLAIM_COOLDOWN_SECONDS:
+                return False
+        idle_workers = [
+            worker
+            for worker in self.workers
+            if worker.healthy and worker.load == 0 and not worker.accepted_prompt_ids
+        ]
+        if not idle_workers:
+            return False
+
+        self._last_memory_reclaim_monotonic = now
+        self._last_memory_reclaim_at = time.time()
+        results = await self._fanout_post(
+            idle_workers,
+            "/free",
+            {"unload_models": True, "free_memory": True},
+        )
+        reclaimed_workers = [item["gpu_index"] for item in results if item["ok"]]
+        if not reclaimed_workers:
+            return False
+        self._memory_reclaim_count += 1
+        self._last_memory_reclaim_workers = reclaimed_workers
+        accounting = self._worker_memory_accounting_status()
+        logging.warning(
+            "%s Aggregate RAM headroom is low (%.2f GiB available, %.2f GiB target); "
+            "asked idle GPU worker(s) %s to release retained memory",
+            LOG_PREFIX,
+            (accounting["available_bytes"] or 0) / 1024**3,
+            (accounting["target_headroom_bytes"] or 0) / 1024**3,
+            ", ".join(str(index) for index in reclaimed_workers),
+        )
+        return True
+
+    async def _memory_pressure_loop(self) -> None:
+        while not self._closing:
+            try:
+                await self._reclaim_idle_worker_memory()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.debug("%s Aggregate RAM pressure check failed", LOG_PREFIX, exc_info=True)
+            await asyncio.sleep(MEMORY_PRESSURE_POLL_SECONDS)
+
+    def _start_memory_pressure_monitor(self) -> None:
+        if self.worker_memory_accounting_source is None or self._memory_pressure_task is not None:
+            return
+        self._memory_pressure_task = asyncio.create_task(
+            self._memory_pressure_loop(),
+            name="comfyui-mgpu-memory-pressure",
         )
 
     def _cleanup_worker_cgroup(self) -> None:
@@ -1024,8 +1226,10 @@ class MultiGpuOrchestrator:
                 logging.warning("%s No CUDA devices found; UI will fall back to native /prompt", LOG_PREFIX)
                 return
 
+            await self._initialize_worker_memory_limit()
             self._initialize_worker_cgroup()
             self._comfy_args = self._load_comfy_args()
+            self.worker_count = len(devices)
 
             for gpu_index in devices:
                 if self._closing:
@@ -1041,11 +1245,16 @@ class MultiGpuOrchestrator:
                 self._spawn_worker(worker, self._comfy_args)
 
             await asyncio.gather(*(self._wait_for_worker(worker) for worker in self.workers))
+            self._start_memory_pressure_monitor()
 
     async def close(self) -> None:
         if self._closing:
             return
         self._closing = True
+        if self._memory_pressure_task is not None:
+            self._memory_pressure_task.cancel()
+            await asyncio.gather(self._memory_pressure_task, return_exceptions=True)
+            self._memory_pressure_task = None
         for worker in self.workers:
             for task in worker.client_bridge_tasks.values():
                 task.cancel()
@@ -1060,6 +1269,9 @@ class MultiGpuOrchestrator:
 
     def close_sync(self) -> None:
         self._closing = True
+        if self._memory_pressure_task is not None:
+            self._memory_pressure_task.cancel()
+            self._memory_pressure_task = None
         for worker in self.workers:
             worker.status = "stopped"
             worker.running = 0
@@ -1275,6 +1487,9 @@ class MultiGpuOrchestrator:
         env = os.environ.copy()
         env[WORKER_ENV_FLAG] = "1"
         env[PARENT_PID_ENV] = str(os.getpid())
+        env[WORKER_COUNT_ENV] = str(max(self.worker_count, 1))
+        if self.worker_memory_limit is not None:
+            env[SYSTEM_RAM_LIMIT_ENV] = str(self.worker_memory_limit)
         stdout_target: Any = subprocess.DEVNULL
         stderr_target: Any = subprocess.DEVNULL
         try:
@@ -1401,6 +1616,14 @@ class MultiGpuOrchestrator:
         healthy = [worker for worker in self.workers if worker.healthy]
         if not healthy:
             return None
+
+        # Starting work on an idle process commonly creates another full model
+        # copy. While RAM is tight, queue behind an already-active worker so the
+        # idle workers can shed retained state instead.
+        if self._memory_is_under_pressure():
+            active = [worker for worker in healthy if worker.load > 0]
+            if active:
+                healthy = active
 
         min_load = min(worker.load for worker in healthy)
         candidates = [worker for worker in healthy if worker.load == min_load]
@@ -2221,6 +2444,7 @@ class MultiGpuOrchestrator:
                     if self.worker_cgroup is not None
                     else {"enabled": False, "error": self.worker_cgroup_error}
                 ),
+                "worker_memory_accounting": self._worker_memory_accounting_status(),
                 "workers": [worker.public_dict() for worker in self.workers],
             }
         )

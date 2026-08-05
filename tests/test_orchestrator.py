@@ -35,6 +35,7 @@ from orchestrator import (  # noqa: E402
     route_with_query,
     save_config,
     synthesize_jobs_payload,
+    vast_instance_memory_limit,
     worker_log_path,
 )
 
@@ -133,6 +134,16 @@ class OrchestratorPureTests(unittest.TestCase):
         self.assertLess(memory_high, memory_max)
         self.assertLess(memory_max, available)
         self.assertGreaterEqual(available - memory_max, int(total * 0.15))
+
+    def test_vast_memory_limit_prefers_reported_limit_then_gpu_fraction(self):
+        self.assertEqual(
+            vast_instance_memory_limit({"instances": {"mem_limit": 15.5}}),
+            15_500_000_000,
+        )
+        self.assertEqual(
+            vast_instance_memory_limit({"instances": {"cpu_ram": 128000, "gpu_frac": 0.25}}),
+            32_000_000_000,
+        )
 
     def test_worker_cgroup_wraps_commands_with_shared_pre_exec_move(self):
         cgroup = WorkerCgroup(
@@ -262,6 +273,19 @@ class OrchestratorPureTests(unittest.TestCase):
         ]
 
         self.assertIsNone(orchestrator.select_worker())
+
+    def test_select_worker_queues_on_active_worker_during_memory_pressure(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=SimpleNamespace())
+        orchestrator.worker_memory_limit = 16 * 1024**3
+        orchestrator.worker_memory_accounting_source = SimpleNamespace(
+            current_usage=lambda: 15 * 1024**3
+        )
+        active = WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000", status="healthy")
+        idle = WorkerState(gpu_index=1, port=9001, url="http://127.0.0.1:9001", status="healthy")
+        active.running = 1
+        orchestrator.workers = [active, idle]
+
+        self.assertIs(orchestrator.select_worker(), active)
 
     def test_aggregate_jobs_filters_sorts_and_paginates(self):
         payload = aggregate_jobs_payload(
@@ -469,6 +493,31 @@ class FakeResponse:
 
 
 class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_memory_pressure_reclaims_only_idle_worker_retained_state(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        orchestrator.worker_memory_limit = 16 * 1024**3
+        orchestrator.worker_memory_accounting_source = SimpleNamespace(
+            current_usage=lambda: 15 * 1024**3
+        )
+        active = WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000", status="healthy")
+        idle = WorkerState(gpu_index=1, port=9001, url="http://127.0.0.1:9001", status="healthy")
+        active.running = 1
+        orchestrator.workers = [active, idle]
+        orchestrator._fanout_post = AsyncMock(
+            return_value=[{"gpu_index": 1, "ok": True}]
+        )
+
+        reclaimed = await orchestrator._reclaim_idle_worker_memory()
+
+        self.assertTrue(reclaimed)
+        orchestrator._fanout_post.assert_awaited_once_with(
+            [idle],
+            "/free",
+            {"unload_models": True, "free_memory": True},
+        )
+        self.assertEqual(orchestrator._memory_reclaim_count, 1)
+        self.assertEqual(orchestrator._last_memory_reclaim_workers, [1])
+
     async def test_queue_snapshot_removes_completed_prompts_from_requeue_ledger(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
         worker = WorkerState(
@@ -818,6 +867,7 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
             orchestrator._spawn_worker(worker, None)
 
         self.assertEqual(popen.call_args.kwargs["env"][PARENT_PID_ENV], str(os.getpid()))
+        self.assertEqual(popen.call_args.kwargs["env"]["COMFYUI_MGPU_WORKER_COUNT"], "1")
 
     async def test_spawned_workers_enter_the_shared_memory_cgroup_before_exec(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
