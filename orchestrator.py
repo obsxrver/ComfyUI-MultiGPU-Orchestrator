@@ -694,6 +694,7 @@ class MultiGpuOrchestrator:
         self.asset_to_worker: dict[str, WorkerState] = {}
         self.prompt_metadata: dict[str, dict[str, Any]] = {}
         self.prompt_progress: dict[str, dict[str, Any]] = {}
+        self.connected_client_ids: set[str] = set()
         self._session: aiohttp.ClientSession | None = None
         self._rr_index = 0
         self._started = False
@@ -764,6 +765,7 @@ class MultiGpuOrchestrator:
             worker.status = "stopped"
             worker.running = 0
             worker.pending = 0
+        self.connected_client_ids.clear()
         await asyncio.gather(*(self._terminate_worker_process(worker) for worker in self.workers))
         if self._session:
             await self._session.close()
@@ -889,6 +891,7 @@ class MultiGpuOrchestrator:
         if self._comfy_args is None:
             self._comfy_args = self._load_comfy_args()
         await self._start_worker_with_retry(worker, prefer_existing_port=False)
+        await self._connect_worker_to_registered_clients(worker)
         return worker
 
     async def _respawn_worker(self, worker: WorkerState) -> bool:
@@ -911,6 +914,7 @@ class MultiGpuOrchestrator:
                 worker.respawn_blocked = True
                 return False
             worker.respawn_blocked = False
+            await self._connect_worker_to_registered_clients(worker)
             if pending_count:
                 if self.requeue_pending_on_respawn:
                     await self._requeue_worker_pending_prompts(worker)
@@ -1130,7 +1134,9 @@ class MultiGpuOrchestrator:
             attempted.add(worker.gpu_index)
             client_id = json_data.get("client_id")
             if client_id:
-                await self.ensure_bridge(worker, str(client_id))
+                client_id = str(client_id)
+                self.connected_client_ids.add(client_id)
+                await self.ensure_bridge(worker, client_id)
             try:
                 response = await self._post_worker(worker, "/prompt", json_data)
                 if response.status < 500:
@@ -1182,6 +1188,48 @@ class MultiGpuOrchestrator:
         if self._started:
             await self.refresh_queues()
         return web.json_response(build_queue_info(self.workers))
+
+    async def connect_client(self, client_id: str) -> dict[str, Any]:
+        client_id = str(client_id or "").strip()
+        if not client_id:
+            raise ValueError("client_id is required")
+
+        self.connected_client_ids.add(client_id)
+        await self.start()
+
+        workers = [worker for worker in self.workers if worker.healthy]
+        results = await asyncio.gather(
+            *(self.ensure_bridge(worker, client_id) for worker in workers),
+            return_exceptions=True,
+        )
+        connected_workers = [
+            worker.gpu_index
+            for worker, result in zip(workers, results)
+            if result is True
+        ]
+
+        await self.refresh_queues()
+        retry_workers = [
+            worker
+            for worker in self.workers
+            if worker.healthy and worker.gpu_index not in connected_workers
+        ]
+        retry_results = await asyncio.gather(
+            *(self.ensure_bridge(worker, client_id) for worker in retry_workers),
+            return_exceptions=True,
+        )
+        connected_workers.extend(
+            worker.gpu_index
+            for worker, result in zip(retry_workers, retry_results)
+            if result is True
+        )
+
+        await self._send_client_snapshot(client_id)
+        return {
+            "client_id": client_id,
+            "connected_workers": connected_workers,
+            "status": build_queue_info(self.workers),
+        }
 
     async def _post_worker(self, worker: WorkerState, route: str, payload: dict[str, Any]) -> aiohttp.ClientResponse:
         if self._session is None:
@@ -1343,7 +1391,8 @@ class MultiGpuOrchestrator:
                 return True
             try:
                 await asyncio.wait_for(ready.wait(), timeout=5)
-                return True
+                await asyncio.sleep(0)
+                return not task.done()
             except asyncio.TimeoutError:
                 logging.warning(
                     "%s Timed out waiting for worker websocket bridge GPU %s client %s",
@@ -1359,7 +1408,8 @@ class MultiGpuOrchestrator:
         worker.client_bridge_tasks[client_id] = task
         try:
             await asyncio.wait_for(ready.wait(), timeout=5)
-            return True
+            await asyncio.sleep(0)
+            return not task.done()
         except asyncio.TimeoutError:
             logging.warning(
                 "%s Timed out waiting for worker websocket bridge GPU %s client %s",
@@ -1368,6 +1418,19 @@ class MultiGpuOrchestrator:
                 client_id,
             )
             return False
+
+    async def _connect_worker_to_registered_clients(self, worker: WorkerState) -> None:
+        if not worker.healthy or not self.connected_client_ids:
+            return
+        sockets = getattr(self.prompt_server, "sockets", None)
+        if isinstance(sockets, dict):
+            self.connected_client_ids.intersection_update(str(key) for key in sockets)
+        if not self.connected_client_ids:
+            return
+        await asyncio.gather(
+            *(self.ensure_bridge(worker, client_id) for client_id in self.connected_client_ids),
+            return_exceptions=True,
+        )
 
     async def _bridge_worker_socket(
         self,
@@ -1901,6 +1964,18 @@ class MultiGpuOrchestrator:
     async def _send_aggregate_status(self, client_id: str) -> None:
         await self.prompt_server.send("status", {"status": build_queue_info(self.workers)}, client_id)
 
+    async def _send_client_snapshot(self, client_id: str) -> None:
+        await self._send_aggregate_status(client_id)
+        active_prompt_ids = {
+            prompt_id
+            for worker in self.workers
+            for prompt_id in worker.accepted_prompt_ids
+        }
+        for prompt_id in sorted(active_prompt_ids):
+            progress = self.prompt_progress.get(prompt_id)
+            if progress is not None:
+                await self.prompt_server.send("progress_state", progress, client_id)
+
     def _start_primary_asset_seed(self) -> None:
         try:
             from app.assets.seeder import asset_seeder
@@ -2008,6 +2083,15 @@ def register_routes() -> MultiGpuOrchestrator | None:
     @routes.post("/mgpu/settings")
     async def mgpu_settings_update(request):
         return await orchestrator.settings_update_response(request)
+
+    @routes.post("/mgpu/connect")
+    async def mgpu_connect(request):
+        payload = await _read_json_or_empty(request)
+        try:
+            response = await orchestrator.connect_client(payload.get("client_id", ""))
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(response)
 
     async def close_workers_with_primary(_app):
         await orchestrator.close()

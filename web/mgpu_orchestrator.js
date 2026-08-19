@@ -317,6 +317,60 @@ function installQueueProgressRowPatch() {
   observer.observe(document.body, { childList: true, subtree: true });
 }
 
+function installPageSynchronization(originalFetchApi) {
+  if (api.__mgpuPageSynchronizationInstalled) return;
+  api.__mgpuPageSynchronizationInstalled = true;
+
+  let connectedClientId = "";
+  let connectPromise = null;
+  let retryTimer = 0;
+  let retryDelay = 1000;
+
+  async function connectPage() {
+    const clientId = String(api.clientId || window.name || "").trim();
+    if (!clientId || clientId === connectedClientId) return;
+    if (connectPromise) return connectPromise;
+
+    connectPromise = (async () => {
+      try {
+        const response = await originalFetchApi("/mgpu/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ client_id: clientId }),
+        });
+        if (!response.ok) {
+          throw new Error(`status ${response.status}`);
+        }
+        connectedClientId = clientId;
+        retryDelay = 1000;
+      } catch (error) {
+        console.warn("[ComfyUI-MGPU] Unable to connect worker event streams.", error);
+        if (!retryTimer) {
+          retryTimer = window.setTimeout(() => {
+            retryTimer = 0;
+            void connectPage();
+          }, retryDelay);
+          retryDelay = Math.min(retryDelay * 2, 10000);
+        }
+      } finally {
+        connectPromise = null;
+      }
+    })();
+
+    return connectPromise;
+  }
+
+  api.addEventListener("status", () => {
+    void connectPage();
+  });
+  api.addEventListener("reconnected", () => {
+    connectedClientId = "";
+    void connectPage();
+  });
+
+  void connectPage();
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -1039,6 +1093,7 @@ app.registerExtension({
 
     api.__mgpuOrchestratorWrapped = true;
     installQueueProgressRowPatch();
+    installPageSynchronization(originalFetchApi);
     installMultiGpuMenu(originalFetchApi);
 
     originalFetchApi("/mgpu/status")

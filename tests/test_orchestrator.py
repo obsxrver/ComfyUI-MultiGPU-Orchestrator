@@ -376,6 +376,75 @@ class FakeResponse:
 
 
 class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connect_client_bridges_workers_and_replays_current_state(self):
+        prompt_server = FakePromptServer()
+        orchestrator = MultiGpuOrchestrator(prompt_server=prompt_server)
+        worker0 = WorkerState(
+            gpu_index=0,
+            port=9000,
+            url="http://127.0.0.1:9000",
+            status="healthy",
+        )
+        worker1 = WorkerState(
+            gpu_index=1,
+            port=9001,
+            url="http://127.0.0.1:9001",
+            status="failed",
+        )
+        worker0.running = 1
+        worker0.accepted_prompt_ids.add("prompt-a")
+        orchestrator.workers = [worker0, worker1]
+        orchestrator.prompt_progress["prompt-a"] = {
+            "prompt_id": "prompt-a",
+            "mgpu": {"total_percent": 42},
+        }
+        orchestrator.start = AsyncMock()
+        orchestrator.refresh_queues = AsyncMock()
+        orchestrator.ensure_bridge = AsyncMock(return_value=True)
+
+        result = await orchestrator.connect_client("client-a")
+
+        orchestrator.start.assert_awaited_once()
+        orchestrator.refresh_queues.assert_awaited_once()
+        orchestrator.ensure_bridge.assert_awaited_once_with(worker0, "client-a")
+        self.assertEqual(orchestrator.connected_client_ids, {"client-a"})
+        self.assertEqual(result["connected_workers"], [0])
+        self.assertEqual(
+            prompt_server.sent,
+            [
+                ("status", {"status": build_queue_info([worker0, worker1])}, "client-a"),
+                (
+                    "progress_state",
+                    orchestrator.prompt_progress["prompt-a"],
+                    "client-a",
+                ),
+            ],
+        )
+
+    async def test_connect_client_rejects_missing_client_id(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+
+        with self.assertRaisesRegex(ValueError, "client_id is required"):
+            await orchestrator.connect_client("  ")
+
+    async def test_worker_restart_reconnect_ignores_stale_browser_clients(self):
+        prompt_server = FakePromptServer()
+        prompt_server.sockets = {"client-live": object()}
+        orchestrator = MultiGpuOrchestrator(prompt_server=prompt_server)
+        worker = WorkerState(
+            gpu_index=0,
+            port=9000,
+            url="http://127.0.0.1:9000",
+            status="healthy",
+        )
+        orchestrator.connected_client_ids.update({"client-live", "client-stale"})
+        orchestrator.ensure_bridge = AsyncMock(return_value=True)
+
+        await orchestrator._connect_worker_to_registered_clients(worker)
+
+        self.assertEqual(orchestrator.connected_client_ids, {"client-live"})
+        orchestrator.ensure_bridge.assert_awaited_once_with(worker, "client-live")
+
     async def test_queue_snapshot_removes_completed_prompts_from_requeue_ledger(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
         worker = WorkerState(
