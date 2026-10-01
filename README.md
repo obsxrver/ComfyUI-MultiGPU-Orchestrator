@@ -1,4 +1,3 @@
-
 # ComfyUI Multi-GPU Orchestrator
 
 ## Use ALL the GPUs!
@@ -8,41 +7,14 @@
   <img width="48%" alt="ComfyUI-MultiGPU-Example 2" src="https://github.com/user-attachments/assets/dad6aa42-3ce2-48a0-a2e2-c8a2b9a2d4d9" />
 </p>
 
-Multi-GPU Orchestrator turns one ComfyUI session into a smart multi-GPU routing system. Perfect for cloud clusters (Vast.AI, Runpod) and CUDA-rich powerusers. Unlock maximum resource utilization by dispatching workflows across every GPU on your system. All you have to do is click the "► Run" button.  
+Run workflows across the CUDA GPUs on your system from one ComfyUI session.
+Queue jobs with the usual "► Run" button, and the orchestrator sends each job
+to the least-busy available GPU worker.
 
 - One ComfyUI instance controls all GPUs.
 - No workflow changes or added configuration required.
-- Queue progress, history, and media
-  assets are all available from the primary UI.
-- Works well with cloud providers out of the box.
-
-## How It Works
-
-When ComfyUI starts, the extension discovers visible CUDA devices and starts
-a ComfyUI worker process on each GPU. The main ComfyUI process stays as the browser-facing
-UI and orchestrator. Worker processes do the generation work.
-
-The normal ComfyUI frontend is patched so queueing, status polling, job progress, and media assets are routed through the orchestrator automatically.
-
-Direct API submissions work the same way: `POST /prompt` (and `/api/prompt`) on the main server is dispatched to the least-busy healthy worker. If no worker is available, the request falls back to the main ComfyUI process.
-
-Individual cancellation and Cancel All route to the workers too, including direct
-`POST /api/jobs/{job_id}/cancel` and `POST /api/jobs/cancel` requests. Batch requests
-use `{"job_ids": ["<uuid>", "..."]}`. Workers handle running-job interruption and
-pending-job removal through ComfyUI's jobs cancellation API. Finished or unknown
-jobs are harmless no-ops; worker failures return HTTP 502 with details, including
-whether any cancellation succeeded. This requires workers with the jobs cancellation API.
-
-The Console keeps the standard `Logs` tab for the main process and adds a
-`GPU N` tab for every worker. Worker output is written to
-`ComfyUI/logs/mgpu-workers/gpu-N.log`; these files are cleared when the
-orchestrator starts and reused for worker restarts during that session.
-
-The MultiGPU sidebar settings can automatically respawn failed workers and,
-independently, re-queue only the jobs that were still running or pending in the
-worker's last queue snapshot. Completed jobs are removed from the replay ledger.
-Workers also stop when the primary ComfyUI server shuts down, restarts, or exits
-unexpectedly.
+- Queue progress, history, and generated media are available from the main UI.
+- Supports local and cloud-hosted systems with multiple CUDA GPUs.
 
 ## Install
 
@@ -53,9 +25,32 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/obsxrver/ComfyUI-MultiGPU-Orchestrator.git
 ```
 
+Restart ComfyUI after installation. The extension automatically starts a worker
+for each visible CUDA GPU.
 
+## Usage
 
-<details>
-<summary>AI-Assisted Development Disclaimer</summary>
-<b>AI-Assisted Development Disclaimer:</b> OpenAI Codex and GPT-5.5-High were utilized to assist in the development of this project. 
-</details>
+Open ComfyUI as usual, load a workflow, and click **► Run**. Queue multiple jobs
+to keep multiple GPUs busy. Each job runs on one GPU; the extension does not
+split a single workflow across GPUs or combine their VRAM.
+
+Use the normal queue controls to cancel individual jobs or cancel all jobs.
+Cancellation requires a ComfyUI version that supports the jobs cancellation API.
+If no GPU worker is available, jobs fall back to the main ComfyUI process.
+
+## Worker Settings
+
+Open the **MultiGPU** sidebar to check worker status and configure:
+
+- **Auto start at startup** — start GPU workers automatically when ComfyUI starts.
+- **Respawn failed workers** — automatically restart workers after a failure.
+- **Re-queue pending jobs on respawn** — retry jobs last known to be running or
+  waiting when a worker failed.
+
+Workers stop when the main ComfyUI server shuts down or restarts.
+
+## Logs
+
+In the Console, use **Logs** for the main ComfyUI process and **GPU N** for an
+individual worker. Worker logs are also saved to
+`ComfyUI/logs/mgpu-workers/gpu-N.log` and cleared when the orchestrator starts.
