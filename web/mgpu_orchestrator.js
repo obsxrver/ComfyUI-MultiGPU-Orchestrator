@@ -58,6 +58,10 @@ function mappedMgpuRoute(route, method) {
     return "/mgpu/history";
   }
 
+  if (method === "POST" && /^\/jobs\/(?:[^/?]+\/)?cancel(?:\?|$)/.test(comparable)) {
+    return routeToMgpu(comparable, "/jobs", "/mgpu/jobs");
+  }
+
   if (
     method === "POST" &&
     (comparable === "/assets/seed" ||

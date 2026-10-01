@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -14,7 +15,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
+from uuid import UUID
 
 try:
     import aiohttp
@@ -61,6 +63,7 @@ FORWARDED_WS_TYPES = {
     "notification",
 }
 DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
+DIRECT_JOB_CANCEL_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs/(?:(?P<prompt_id>[^/]+)/)?cancel$")
 _PARENT_WATCHDOG_STARTED = False
 
 
@@ -1605,6 +1608,77 @@ class MultiGpuOrchestrator:
         status = 200 if any(item["ok"] for item in result) else 424
         return web.json_response({"workers": result}, status=status)
 
+    async def proxy_job_cancel(
+        self, request: Any, prompt_id: str | None = None, no_worker_fallback: Any = None,
+    ) -> Any:
+        if prompt_id is None:
+            try:
+                payload = await request.json()
+            except (ValueError, UnicodeDecodeError):
+                return web.json_response({"error": "Request body must be valid JSON"}, status=400)
+            job_ids = payload.get("job_ids") if isinstance(payload, dict) else None
+            if not isinstance(job_ids, list):
+                return web.json_response({"error": "job_ids must be a list"}, status=400)
+            invalid_ids = []
+            for job_id in job_ids:
+                try:
+                    if not isinstance(job_id, str) or str(UUID(job_id)) != job_id:
+                        raise ValueError("invalid job id")
+                except ValueError:
+                    invalid_ids.append(job_id if isinstance(job_id, str) else repr(job_id))
+            if invalid_ids:
+                return web.json_response(
+                    {"error": "job_ids contains invalid id(s)", "invalid_ids": invalid_ids}, status=400,
+                )
+            if not job_ids:
+                return web.json_response({"cancelled": False})
+            payload = {"job_ids": list(dict.fromkeys(job_ids))}
+            route = "/api/jobs/cancel"
+        else:
+            job_ids = [prompt_id]
+            payload = {}
+            route = f"/api/jobs/{quote(prompt_id, safe='')}/cancel"
+
+        # Cancelling must not start workers (or respawn their pending jobs).
+        if not self.workers:
+            if no_worker_fallback is not None:
+                return await no_worker_fallback(request)
+            return web.json_response({"cancelled": False, "error": "no workers available"}, status=424)
+
+        cancelled = False
+        errors = []
+        # IDs unknown on a worker are harmless no-ops. Query every worker so
+        # cancellation does not depend on an in-memory ownership map.
+        for worker in self.workers:
+            try:
+                response = await self._post_worker(worker, route, payload)
+                body = await response.read()
+                if response.status != 200:
+                    raise RuntimeError(f"worker returned HTTP {response.status}")
+                result = json.loads(body)
+                if not isinstance(result, dict) or not isinstance(result.get("cancelled"), bool):
+                    raise ValueError("invalid worker cancellation response")
+                if result["cancelled"]:
+                    cancelled = True
+                    for job_id in job_ids:
+                        worker.pending_prompt_payloads.pop(job_id, None)
+                        worker.accepted_prompt_ids.discard(job_id)
+            except Exception as exc:
+                errors.append({"gpu_index": worker.gpu_index, "error": str(exc)})
+
+        # Read snapshots directly: refresh_queues can respawn a failed worker.
+        for worker in self.workers:
+            try:
+                snapshot = await self._fetch_worker_json(worker, "/queue")
+                self._apply_worker_queue_snapshot(worker, snapshot)
+            except Exception:
+                pass
+        await self._send_aggregate_status(None)
+        result = {"cancelled": cancelled}
+        if errors:
+            result.update(error="Cancellation failed on one or more workers", workers=errors)
+        return web.json_response(result, status=502 if errors else 200)
+
     async def proxy_free(self, request: Any) -> Any:
         await self.start()
         payload = await _read_json_or_empty(request)
@@ -1961,7 +2035,7 @@ class MultiGpuOrchestrator:
             worker.last_seen = time.time()
             worker.status = "healthy"
 
-    async def _send_aggregate_status(self, client_id: str) -> None:
+    async def _send_aggregate_status(self, client_id: str | None) -> None:
         await self.prompt_server.send("status", {"status": build_queue_info(self.workers)}, client_id)
 
     async def _send_client_snapshot(self, client_id: str) -> None:
@@ -2032,6 +2106,11 @@ def create_direct_prompt_routing_middleware(orchestrator: MultiGpuOrchestrator) 
     async def route_direct_prompt_request(request: Any, handler: Any) -> Any:
         if request.method == "POST" and request.path in DIRECT_PROMPT_PATHS:
             return await orchestrator.proxy_prompt(request, no_worker_fallback=handler)
+        cancel_match = DIRECT_JOB_CANCEL_PATH.fullmatch(request.path) if request.method == "POST" else None
+        if cancel_match is not None:
+            return await orchestrator.proxy_job_cancel(
+                request, prompt_id=cancel_match.group("prompt_id"), no_worker_fallback=handler,
+            )
         return await handler(request)
 
     return route_direct_prompt_request
@@ -2042,10 +2121,10 @@ def install_direct_prompt_routing(prompt_server: Any, orchestrator: MultiGpuOrch
         middleware = create_direct_prompt_routing_middleware(orchestrator)
         prompt_server.app.middlewares.append(middleware)
     except Exception:
-        logging.exception("%s Failed to enable direct /prompt API routing", LOG_PREFIX)
+        logging.exception("%s Failed to enable direct prompt and job cancellation API routing", LOG_PREFIX)
         return False
 
-    logging.info("%s Direct /prompt API requests will be routed to workers", LOG_PREFIX)
+    logging.info("%s Direct prompt and job cancellation API requests will be routed to workers", LOG_PREFIX)
     return True
 
 
@@ -2153,6 +2232,14 @@ def register_routes() -> MultiGpuOrchestrator | None:
     @routes.get("/mgpu/jobs/{prompt_id}")
     async def mgpu_job_detail(request):
         return await orchestrator.proxy_job_detail(request)
+
+    @routes.post("/mgpu/jobs/cancel")
+    async def mgpu_jobs_cancel(request):
+        return await orchestrator.proxy_job_cancel(request)
+
+    @routes.post("/mgpu/jobs/{prompt_id}/cancel")
+    async def mgpu_job_cancel(request):
+        return await orchestrator.proxy_job_cancel(request, prompt_id=request.match_info["prompt_id"])
 
     @routes.get("/mgpu/queue")
     async def mgpu_queue(request):

@@ -6,7 +6,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
+import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -376,6 +378,121 @@ class FakeResponse:
 
 
 class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_endpoints_reach_workers_without_browser_rewriting(self):
+        from contextlib import AsyncExitStack
+
+        async with AsyncExitStack() as stack:
+            orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+            orchestrator._session = await stack.enter_async_context(aiohttp.ClientSession())
+            queues = []
+            for index in range(2):
+                running, pending, untouched = (str(uuid4()) for _ in range(3))
+                active = {running, pending, untouched}
+                queues.append((active, running, pending, untouched))
+                app = web.Application()
+
+                async def cancel(request, active=active):
+                    job_id = request.match_info.get("job_id")
+                    ids = [job_id] if job_id else (await request.json())["job_ids"]
+                    cancelled = bool(active.intersection(ids))
+                    active.difference_update(ids)
+                    return web.json_response({"cancelled": cancelled})
+
+                async def queue(request, active=active, running=running):
+                    return web.json_response({
+                        "queue_running": [[0, jid, {}, {}, []] for jid in active if jid == running],
+                        "queue_pending": [[1, jid, {}, {}, []] for jid in active if jid != running],
+                    })
+
+                app.router.add_post("/api/jobs/cancel", cancel)
+                app.router.add_post("/api/jobs/{job_id}/cancel", cancel)
+                app.router.add_get("/queue", queue)
+                server = await stack.enter_async_context(TestServer(app))
+                worker = WorkerState(gpu_index=index, port=server.port, url=str(server.make_url("/")).rstrip("/"))
+                worker.pending_prompt_payloads = {jid: {} for jid in active}
+                worker.accepted_prompt_ids = set(active)
+                orchestrator.workers.append(worker)
+
+            parent = web.Application(middlewares=[create_direct_prompt_routing_middleware(orchestrator)])
+            native = AsyncMock(return_value=web.json_response({"cancelled": False}))
+            parent.router.add_post("/api/jobs/cancel", native)
+            parent.router.add_post("/api/jobs/{job_id}/cancel", native)
+            client = await stack.enter_async_context(TestClient(TestServer(parent)))
+
+            # No ownership map: single cancel must still find worker 1.
+            response = await client.post(f"/api/jobs/{queues[1][1]}/cancel")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {"cancelled": True})
+            self.assertNotIn(queues[1][1], queues[1][0])
+            response = await client.post("/api/jobs/cancel", json={
+                "job_ids": [queues[0][1], queues[0][2], queues[1][2], str(uuid4())],
+            })
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {"cancelled": True})
+            for worker, (active, running, pending, untouched) in zip(orchestrator.workers, queues):
+                self.assertEqual(active, {untouched})
+                self.assertEqual(set(worker.pending_prompt_payloads), {untouched})
+                self.assertEqual(worker.accepted_prompt_ids, {untouched})
+                self.assertEqual(worker.running, 0)
+                self.assertEqual(worker.pending, 1)
+            response = await client.post(f"/api/jobs/{queues[1][1]}/cancel")
+            self.assertEqual(await response.json(), {"cancelled": False})
+            native.assert_not_awaited()
+            self.assertEqual(orchestrator.prompt_server.sent[-1][0], "status")
+
+    async def test_cancel_validates_batch_before_contacting_workers(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        orchestrator._post_worker = AsyncMock()
+        for payload in (None, [], {}, {"job_ids": "all"}, {"job_ids": [str(uuid4()), {}]}, {"job_ids": [1]}):
+            response = await orchestrator.proxy_job_cancel(SimpleNamespace(json=AsyncMock(return_value=payload)))
+            self.assertEqual(response.status, 400)
+        response = await orchestrator.proxy_job_cancel(SimpleNamespace(json=AsyncMock(side_effect=ValueError)))
+        self.assertEqual(response.status, 400)
+        response = await orchestrator.proxy_job_cancel(SimpleNamespace(json=AsyncMock(return_value={"job_ids": []})))
+        self.assertEqual(json.loads(response.body), {"cancelled": False})
+        orchestrator._post_worker.assert_not_awaited()
+
+    async def test_cancel_reports_partial_and_total_worker_failures(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        orchestrator.workers = [WorkerState(gpu_index=i, port=9000+i, url="http://worker") for i in range(2)]
+        orchestrator._fetch_worker_json = AsyncMock(return_value={"queue_running": [], "queue_pending": []})
+        orchestrator.start = AsyncMock()
+        for first_response in (FakeResponse(b'{"cancelled":true}'), FakeResponse(b'{"cancelled":false}'), FakeResponse(b'{}', 404)):
+            orchestrator._post_worker = AsyncMock(side_effect=[first_response, OSError("worker offline")])
+            response = await orchestrator.proxy_job_cancel(SimpleNamespace(), prompt_id=str(uuid4()))
+            self.assertEqual(response.status, 502)
+            result = json.loads(response.body)
+            self.assertEqual(result["cancelled"], first_response.body == b'{"cancelled":true}')
+            self.assertTrue(result["workers"])
+            self.assertEqual(orchestrator._post_worker.await_count, 2)
+        orchestrator.start.assert_not_awaited()
+
+    async def test_direct_cancel_middleware_handles_aliases_and_preserves_other_routes(self):
+        orchestrator = SimpleNamespace(proxy_job_cancel=AsyncMock(return_value="cancelled"))
+        middleware = create_direct_prompt_routing_middleware(orchestrator)
+        native = AsyncMock(return_value="native")
+        for prefix in ("", "/api", "/api/api"):
+            for suffix, prompt_id in (("cancel", None), ("job-id/cancel", "job-id")):
+                request = SimpleNamespace(method="POST", path=f"{prefix}/jobs/{suffix}")
+                self.assertEqual(await middleware(request, native), "cancelled")
+                orchestrator.proxy_job_cancel.assert_awaited_with(request, prompt_id=prompt_id, no_worker_fallback=native)
+        for method, path in (("GET", "/api/jobs/cancel"), ("POST", "/api/jobs/id/retry"), ("POST", "/mgpu/jobs/cancel")):
+            self.assertEqual(await middleware(SimpleNamespace(method=method, path=path), native), "native")
+
+    async def test_direct_cancel_without_workers_preserves_native_body(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        app = web.Application(middlewares=[create_direct_prompt_routing_middleware(orchestrator)])
+
+        async def native(request):
+            return web.json_response(await request.json())
+
+        app.router.add_post("/api/jobs/cancel", native)
+        async with TestClient(TestServer(app)) as client:
+            payload = {"job_ids": [str(uuid4())]}
+            response = await client.post("/api/jobs/cancel", json=payload)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), payload)
+
     async def test_connect_client_bridges_workers_and_replays_current_state(self):
         prompt_server = FakePromptServer()
         orchestrator = MultiGpuOrchestrator(prompt_server=prompt_server)

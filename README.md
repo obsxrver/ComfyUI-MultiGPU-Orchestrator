@@ -26,6 +26,13 @@ The normal ComfyUI frontend is patched so queueing, status polling, job progress
 
 Direct API submissions work the same way: `POST /prompt` (and `/api/prompt`) on the main server is dispatched to the least-busy healthy worker. If no worker is available, the request falls back to the main ComfyUI process.
 
+Individual cancellation and Cancel All route to the workers too, including direct
+`POST /api/jobs/{job_id}/cancel` and `POST /api/jobs/cancel` requests. Batch requests
+use `{"job_ids": ["<uuid>", "..."]}`. Workers handle running-job interruption and
+pending-job removal through ComfyUI's jobs cancellation API. Finished or unknown
+jobs are harmless no-ops; worker failures return HTTP 502 with details, including
+whether any cancellation succeeded. This requires workers with the jobs cancellation API.
+
 The Console keeps the standard `Logs` tab for the main process and adds a
 `GPU N` tab for every worker. Worker output is written to
 `ComfyUI/logs/mgpu-workers/gpu-N.log`; these files are cleared when the
