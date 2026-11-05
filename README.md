@@ -7,14 +7,14 @@
   <img width="48%" alt="ComfyUI-MultiGPU-Example 2" src="https://github.com/user-attachments/assets/dad6aa42-3ce2-48a0-a2e2-c8a2b9a2d4d9" />
 </p>
 
-Run workflows across the CUDA GPUs on your system from one ComfyUI session.
+Run workflows across the CUDA or Intel XPU GPUs on your system from one ComfyUI session.
 Queue jobs with the usual "► Run" button, and the orchestrator sends each job
 to the least-busy available GPU worker.
 
 - One ComfyUI instance controls all GPUs.
 - No workflow changes or added configuration required.
 - Queue progress, history, and generated media are available from the main UI.
-- Supports local and cloud-hosted systems with multiple CUDA GPUs.
+- Supports local and cloud-hosted systems with multiple CUDA GPUs or Intel XPU GPUs.
 
 ## Install
 
