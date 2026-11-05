@@ -66,3 +66,25 @@ Workers stop when the main ComfyUI server shuts down or restarts.
 In the Console, use **Logs** for the main ComfyUI process and **GPU N** for an
 individual worker. Worker logs are also saved to
 `ComfyUI/logs/mgpu-workers/gpu-N.log` and cleared when the orchestrator starts.
+
+## Intel XPU support (fork notes)
+
+This fork adds Intel GPU support to the original ComfyUI-MultiGPU-Orchestrator.
+If PyTorch has no CUDA device but an XPU device is available, each worker is pinned
+to one GPU with `ZE_AFFINITY_MASK`. NVIDIA behaviour is unchanged, except that
+`--disable-assets` is only passed on ComfyUI versions that support it, and workers
+use a private in-memory database.
+
+**Tested on:** 2x Intel Arc Pro B70, Windows, PyTorch 2.14.0+xpu, ComfyUI 0.37.4.
+The NVIDIA path has not been tested on real hardware by the fork author.
+
+**Limitations:** one backend per machine (CUDA first, then XPU); mixed NVIDIA + Intel
+setups are not supported. Each worker loads its own copy of the model, so VRAM is not
+pooled. Intel workers launch with `--disable-pinned-memory --cache-none
+--enable-cors-header`; extend or override with `COMFYUI_MGPU_WORKER_FLAGS`. Set
+`COMFYUI_MGPU_DEVICES=0,1` to choose which GPUs to use (for example, to skip an
+integrated GPU).
+
+No support is promised. Based on
+[obsxrver/ComfyUI-MultiGPU-Orchestrator](https://github.com/obsxrver/ComfyUI-MultiGPU-Orchestrator),
+licensed under MIT (see `LICENSE`). Intel XPU changes by dastj68-droid.
