@@ -69,6 +69,7 @@ FORWARDED_WS_TYPES = {
 }
 DIRECT_HISTORY_PATH = re.compile(r"^/(?:api/)?history(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
+DIRECT_QUEUE_PATH = re.compile(r"^/(?:api/)?queue$")
 DIRECT_JOBS_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_JOB_CANCEL_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs/(?:(?P<prompt_id>[^/]+)/)?cancel$")
 _PARENT_WATCHDOG_STARTED = False
@@ -347,12 +348,22 @@ def build_worker_env(gpu_index: int, backend: str) -> dict[str, str]:
     env = os.environ.copy()
     if backend == "xpu":
         # Level Zero: the worker only sees one GPU, which appears as xpu:0.
-        # If the primary process was itself launched with a ZE_AFFINITY_MASK
-        # list, gpu_index is relative to that list, so map it back.
-        existing = [item.strip() for item in env.get("ZE_AFFINITY_MASK", "").split(",") if item.strip()]
-        target = existing[gpu_index] if gpu_index < len(existing) else str(gpu_index)
-        env["ZE_AFFINITY_MASK"] = target
-        env.pop("ONEAPI_DEVICE_SELECTOR", None)
+        selector = env.get("ONEAPI_DEVICE_SELECTOR", "").strip()
+        simple = re.fullmatch(r"([A-Za-z_]+):(\d+(?:\s*,\s*\d+)*)", selector)
+        if simple:
+            # The primary was launched with a simple selector such as
+            # "level_zero:1" or "level_zero:0,1", so gpu_index is relative to that
+            # list. Pin the worker to the matching entry and leave the mask alone.
+            ids = [item.strip() for item in simple.group(2).split(",")]
+            target = ids[gpu_index] if gpu_index < len(ids) else str(gpu_index)
+            env["ONEAPI_DEVICE_SELECTOR"] = f"{simple.group(1)}:{target}"
+        else:
+            # If the primary was launched with a ZE_AFFINITY_MASK list, gpu_index
+            # is relative to that list, so map it back.
+            existing = [item.strip() for item in env.get("ZE_AFFINITY_MASK", "").split(",") if item.strip()]
+            target = existing[gpu_index] if gpu_index < len(existing) else str(gpu_index)
+            env["ZE_AFFINITY_MASK"] = target
+            env.pop("ONEAPI_DEVICE_SELECTOR", None)
     return env
 
 
@@ -2034,6 +2045,41 @@ class MultiGpuOrchestrator:
             )
         )
 
+    async def proxy_direct_queue(self, request: Any, native_handler: Any) -> Any:
+        """GET /queue on the primary: its own queue plus jobs running on workers.
+
+        Clients such as comfy-cli decide a job is lost when neither /queue nor
+        /history on the primary mentions its prompt_id. A job executing on a
+        worker is in neither until it finishes, so it is merged in here, the same
+        way /api/jobs already is.
+        """
+        native_response = await native_handler(request)
+        if not self._started or not self.workers or native_response.status != 200:
+            return native_response
+        try:
+            native_payload = json.loads(native_response.body)
+            if not isinstance(native_payload, dict):
+                return native_response
+            worker_payloads = await asyncio.wait_for(self._fetch_worker_payloads("/queue"), timeout=5)
+        except Exception:
+            return native_response
+
+        def entry_id(entry: Any) -> Any:
+            return entry[1] if isinstance(entry, (list, tuple)) and len(entry) > 1 else None
+
+        merged = {key: list(native_payload.get(key) or []) for key in ("queue_running", "queue_pending")}
+        seen = {entry_id(entry) for entries in merged.values() for entry in entries} - {None}
+        for payload in worker_payloads:
+            for key in ("queue_running", "queue_pending"):
+                for entry in payload.get(key) or []:
+                    prompt_id = entry_id(entry)
+                    if prompt_id is not None:
+                        if prompt_id in seen:
+                            continue
+                        seen.add(prompt_id)
+                    merged[key].append(entry)
+        return web.json_response({**native_payload, **merged})
+
     async def proxy_queue(self, _request: Any) -> Any:
         if not self._started:
             return web.json_response({"error": "workers are not started"}, status=424)
@@ -2371,6 +2417,8 @@ def create_direct_prompt_routing_middleware(orchestrator: MultiGpuOrchestrator) 
             return await orchestrator.proxy_direct_jobs(
                 request, native_handler=handler, prompt_id=jobs_match.group("prompt_id"),
             )
+        if request.method == "GET" and DIRECT_QUEUE_PATH.fullmatch(request.path):
+            return await orchestrator.proxy_direct_queue(request, native_handler=handler)
         return await handler(request)
 
     return route_direct_prompt_request
@@ -2381,10 +2429,10 @@ def install_direct_prompt_routing(prompt_server: Any, orchestrator: MultiGpuOrch
         middleware = create_direct_prompt_routing_middleware(orchestrator)
         prompt_server.app.middlewares.append(middleware)
     except Exception:
-        logging.exception("%s Failed to enable direct prompt, history, and jobs API routing", LOG_PREFIX)
+        logging.exception("%s Failed to enable direct prompt, history, queue, and jobs API routing", LOG_PREFIX)
         return False
 
-    logging.info("%s Direct prompt, history, and jobs API requests are integrated with workers", LOG_PREFIX)
+    logging.info("%s Direct prompt, history, queue, and jobs API requests are integrated with workers", LOG_PREFIX)
     return True
 
 
