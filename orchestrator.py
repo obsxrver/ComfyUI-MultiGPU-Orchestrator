@@ -48,6 +48,11 @@ CUDA_ERROR_MARKERS = (
     "no cuda gpus are available",
     "cublas",
     "cudnn",
+    # Intel XPU / Level Zero equivalents
+    "xpu out of memory",
+    "ur_result_error",
+    "level_zero",
+    "ze_result",
 )
 FORWARDED_WS_TYPES = {
     "execution_start",
@@ -64,6 +69,7 @@ FORWARDED_WS_TYPES = {
 }
 DIRECT_HISTORY_PATH = re.compile(r"^/(?:api/)?history(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
+DIRECT_QUEUE_PATH = re.compile(r"^/(?:api/)?queue$")
 DIRECT_JOBS_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_JOB_CANCEL_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs/(?:(?P<prompt_id>[^/]+)/)?cancel$")
 _PARENT_WATCHDOG_STARTED = False
@@ -280,6 +286,7 @@ def build_worker_command(
     python_executable: str | None = None,
     comfy_root: Path | None = None,
     comfy_args: Any = None,
+    backend: str = "cuda",
 ) -> list[str]:
     root = comfy_root or find_comfy_root()
     command = [
@@ -289,11 +296,24 @@ def build_worker_command(
         "127.0.0.1",
         "--port",
         str(port),
-        "--cuda-device",
-        str(gpu_index),
         "--disable-auto-launch",
-        "--disable-assets",
     ]
+    # --disable-assets only exists in some ComfyUI versions. Newer ones removed it,
+    # and passing it makes the worker exit at startup (upstream issue #4). Only pass
+    # it when the primary's own parsed args know about the option.
+    if comfy_args is not None and hasattr(comfy_args, "disable_assets"):
+        command.append("--disable-assets")
+    if backend == "cuda":
+        command.extend(["--cuda-device", str(gpu_index)])
+    elif backend == "xpu":
+        # Intel XPU workers are pinned via ZE_AFFINITY_MASK (see build_worker_env),
+        # so no device flag is needed. These flags were chosen on 2x Arc Pro B70
+        # with large video models; adjust via COMFYUI_MGPU_WORKER_FLAGS if needed.
+        command.extend([
+            "--disable-pinned-memory",
+            "--cache-none",
+            "--enable-cors-header",
+        ])
 
     if comfy_args is not None:
         _optional_path_flag(command, "--base-directory", getattr(comfy_args, "base_directory", None))
@@ -304,6 +324,16 @@ def build_worker_command(
         for config_path in getattr(comfy_args, "extra_model_paths_config", []) or []:
             _optional_path_flag(command, "--extra-model-paths-config", config_path)
 
+    # Newer ComfyUI builds open a shared SQLite database at startup, so the primary
+    # and every worker collide ("Database is locked"). Give each worker a private
+    # in-memory database. Only done when the primary's args expose the option, and
+    # skipped if the user already supplies --database-url via COMFYUI_MGPU_WORKER_FLAGS.
+    if (
+        getattr(comfy_args, "database_url", None) is not None
+        and "--database-url" not in os.environ.get("COMFYUI_MGPU_WORKER_FLAGS", "")
+    ):
+        command.extend(["--database-url", "sqlite:///:memory:"])
+
     extra_flags = os.environ.get("COMFYUI_MGPU_WORKER_FLAGS", "").strip()
     if extra_flags:
         import shlex
@@ -313,18 +343,54 @@ def build_worker_command(
     return command
 
 
-def discover_cuda_devices() -> list[int]:
-    configured = parse_device_list(os.environ.get("COMFYUI_MGPU_DEVICES"))
-    if configured is not None:
-        return configured
+def build_worker_env(gpu_index: int, backend: str) -> dict[str, str]:
+    """Environment for a worker process, pinned to a single GPU."""
+    env = os.environ.copy()
+    if backend == "xpu":
+        # Level Zero: the worker only sees one GPU, which appears as xpu:0.
+        selector = env.get("ONEAPI_DEVICE_SELECTOR", "").strip()
+        simple = re.fullmatch(r"([A-Za-z_]+):(\d+(?:\s*,\s*\d+)*)", selector)
+        if simple:
+            # The primary was launched with a simple selector such as
+            # "level_zero:1" or "level_zero:0,1", so gpu_index is relative to that
+            # list. Pin the worker to the matching entry and leave the mask alone.
+            ids = [item.strip() for item in simple.group(2).split(",")]
+            target = ids[gpu_index] if gpu_index < len(ids) else str(gpu_index)
+            env["ONEAPI_DEVICE_SELECTOR"] = f"{simple.group(1)}:{target}"
+        else:
+            # If the primary was launched with a ZE_AFFINITY_MASK list, gpu_index
+            # is relative to that list, so map it back.
+            existing = [item.strip() for item in env.get("ZE_AFFINITY_MASK", "").split(",") if item.strip()]
+            target = existing[gpu_index] if gpu_index < len(existing) else str(gpu_index)
+            env["ZE_AFFINITY_MASK"] = target
+            env.pop("ONEAPI_DEVICE_SELECTOR", None)
+    return env
 
+
+def discover_devices() -> tuple[str, list[int]]:
+    """Return (backend, device indices). backend is "cuda", "xpu" or "none"."""
+    configured = parse_device_list(os.environ.get("COMFYUI_MGPU_DEVICES"))
+    backend = "none"
+    count = 0
     try:
         import torch
 
-        return list(range(torch.cuda.device_count()))
+        if torch.cuda.is_available():
+            backend, count = "cuda", torch.cuda.device_count()
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            backend, count = "xpu", torch.xpu.device_count()
     except Exception:
-        logging.exception("%s Failed to query torch.cuda.device_count()", LOG_PREFIX)
-        return []
+        logging.exception("%s Failed to query GPU devices", LOG_PREFIX)
+
+    if configured is not None:
+        # Explicit device list wins; keep legacy CUDA behaviour if nothing was detected.
+        return (backend if backend != "none" else "cuda"), configured
+    return backend, list(range(count))
+
+
+def discover_cuda_devices() -> list[int]:
+    # Backward-compatible wrapper.
+    return discover_devices()[1]
 
 
 def parse_status_filter(value: str | None) -> list[str] | None:
@@ -701,6 +767,7 @@ class MultiGpuOrchestrator:
         self.connected_client_ids: set[str] = set()
         self._session: aiohttp.ClientSession | None = None
         self._rr_index = 0
+        self.backend = "cuda"
         self._started = False
         self._closing = False
         self._start_lock = asyncio.Lock()
@@ -740,11 +807,12 @@ class MultiGpuOrchestrator:
             self._started = True
             await self._ensure_session()
 
-            devices = discover_cuda_devices()
+            self.backend, devices = discover_devices()
             log_paths = reset_worker_logs(self.comfy_root, devices)
             if not devices:
-                logging.warning("%s No CUDA devices found; UI will fall back to native /prompt", LOG_PREFIX)
+                logging.warning("%s No supported GPUs (CUDA/XPU) found; UI will fall back to native /prompt", LOG_PREFIX)
                 return
+            logging.info("%s Detected backend %s with device(s) %s", LOG_PREFIX, self.backend, devices)
 
             self._comfy_args = self._load_comfy_args()
 
@@ -1001,8 +1069,9 @@ class MultiGpuOrchestrator:
             worker.port,
             comfy_root=self.comfy_root,
             comfy_args=comfy_args,
+            backend=self.backend,
         )
-        env = os.environ.copy()
+        env = build_worker_env(worker.gpu_index, self.backend)
         env[WORKER_ENV_FLAG] = "1"
         env[PARENT_PID_ENV] = str(os.getpid())
         stdout_target: Any = subprocess.DEVNULL
@@ -1976,6 +2045,41 @@ class MultiGpuOrchestrator:
             )
         )
 
+    async def proxy_direct_queue(self, request: Any, native_handler: Any) -> Any:
+        """GET /queue on the primary: its own queue plus jobs running on workers.
+
+        Clients such as comfy-cli decide a job is lost when neither /queue nor
+        /history on the primary mentions its prompt_id. A job executing on a
+        worker is in neither until it finishes, so it is merged in here, the same
+        way /api/jobs already is.
+        """
+        native_response = await native_handler(request)
+        if not self._started or not self.workers or native_response.status != 200:
+            return native_response
+        try:
+            native_payload = json.loads(native_response.body)
+            if not isinstance(native_payload, dict):
+                return native_response
+            worker_payloads = await asyncio.wait_for(self._fetch_worker_payloads("/queue"), timeout=5)
+        except Exception:
+            return native_response
+
+        def entry_id(entry: Any) -> Any:
+            return entry[1] if isinstance(entry, (list, tuple)) and len(entry) > 1 else None
+
+        merged = {key: list(native_payload.get(key) or []) for key in ("queue_running", "queue_pending")}
+        seen = {entry_id(entry) for entries in merged.values() for entry in entries} - {None}
+        for payload in worker_payloads:
+            for key in ("queue_running", "queue_pending"):
+                for entry in payload.get(key) or []:
+                    prompt_id = entry_id(entry)
+                    if prompt_id is not None:
+                        if prompt_id in seen:
+                            continue
+                        seen.add(prompt_id)
+                    merged[key].append(entry)
+        return web.json_response({**native_payload, **merged})
+
     async def proxy_queue(self, _request: Any) -> Any:
         if not self._started:
             return web.json_response({"error": "workers are not started"}, status=424)
@@ -2313,6 +2417,8 @@ def create_direct_prompt_routing_middleware(orchestrator: MultiGpuOrchestrator) 
             return await orchestrator.proxy_direct_jobs(
                 request, native_handler=handler, prompt_id=jobs_match.group("prompt_id"),
             )
+        if request.method == "GET" and DIRECT_QUEUE_PATH.fullmatch(request.path):
+            return await orchestrator.proxy_direct_queue(request, native_handler=handler)
         return await handler(request)
 
     return route_direct_prompt_request
@@ -2323,10 +2429,10 @@ def install_direct_prompt_routing(prompt_server: Any, orchestrator: MultiGpuOrch
         middleware = create_direct_prompt_routing_middleware(orchestrator)
         prompt_server.app.middlewares.append(middleware)
     except Exception:
-        logging.exception("%s Failed to enable direct prompt, history, and jobs API routing", LOG_PREFIX)
+        logging.exception("%s Failed to enable direct prompt, history, queue, and jobs API routing", LOG_PREFIX)
         return False
 
-    logging.info("%s Direct prompt, history, and jobs API requests are integrated with workers", LOG_PREFIX)
+    logging.info("%s Direct prompt, history, queue, and jobs API requests are integrated with workers", LOG_PREFIX)
     return True
 
 
