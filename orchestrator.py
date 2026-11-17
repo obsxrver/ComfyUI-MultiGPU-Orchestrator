@@ -64,6 +64,11 @@ FORWARDED_WS_TYPES = {
 }
 DIRECT_HISTORY_PATH = re.compile(r"^/(?:api/)?history(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
+# The shared session has no total timeout (worker websocket bridges are long-lived), so every plain HTTP request
+# to a worker gets its own: a lost connection must not leave a request waiting forever for the connection pool.
+WORKER_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60, sock_connect=10)
+WORKER_POST_TIMEOUT = aiohttp.ClientTimeout(total=120, sock_connect=10)
+BRIDGE_REAP_INTERVAL_SECONDS = 60
 DIRECT_JOBS_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_JOB_CANCEL_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs/(?:(?P<prompt_id>[^/]+)/)?cancel$")
 _PARENT_WATCHDOG_STARTED = False
@@ -707,6 +712,7 @@ class MultiGpuOrchestrator:
         self._history_lock = asyncio.Lock()
         self._pending_history: dict[str, WorkerState] = {}
         self._history_sync_task: asyncio.Task | None = None
+        self._bridge_reaper_task: asyncio.Task | None = None
         self._deleted_history_ids: set[str] = set()
         self._comfy_args: Any = None
         self.log_session_id = str(time.time_ns())
@@ -739,6 +745,8 @@ class MultiGpuOrchestrator:
                 return
             self._started = True
             await self._ensure_session()
+            if self._bridge_reaper_task is None:
+                self._bridge_reaper_task = asyncio.create_task(self._reap_bridges())
 
             devices = discover_cuda_devices()
             log_paths = reset_worker_logs(self.comfy_root, devices)
@@ -771,6 +779,10 @@ class MultiGpuOrchestrator:
             self._history_sync_task.cancel()
             await asyncio.gather(self._history_sync_task, return_exceptions=True)
             self._history_sync_task = None
+        if self._bridge_reaper_task is not None:
+            self._bridge_reaper_task.cancel()
+            await asyncio.gather(self._bridge_reaper_task, return_exceptions=True)
+            self._bridge_reaper_task = None
         self._pending_history.clear()
         for worker in self.workers:
             for task in worker.client_bridge_tasks.values():
@@ -1085,7 +1097,7 @@ class MultiGpuOrchestrator:
     async def _fetch_worker_json(self, worker: WorkerState, route: str) -> Any:
         if self._session is None:
             raise RuntimeError("orchestrator session is not ready")
-        async with self._session.get(worker.url + route) as response:
+        async with self._session.get(worker.url + route, timeout=WORKER_HTTP_TIMEOUT) as response:
             response.raise_for_status()
             return await response.json()
 
@@ -1098,7 +1110,7 @@ class MultiGpuOrchestrator:
         if self._session is None:
             raise RuntimeError("orchestrator session is not ready")
         query_string = f"?{urlencode(query, doseq=True)}" if query else ""
-        async with self._session.get(worker.url + route + query_string) as response:
+        async with self._session.get(worker.url + route + query_string, timeout=WORKER_HTTP_TIMEOUT) as response:
             response.raise_for_status()
             return await response.json()
 
@@ -1153,8 +1165,12 @@ class MultiGpuOrchestrator:
             client_id = json_data.get("client_id")
             if client_id:
                 client_id = str(client_id)
-                self.connected_client_ids.add(client_id)
-                await self.ensure_bridge(worker, client_id)
+                if self._client_has_socket(client_id):
+                    # Only a client with a live websocket here can receive bridged events. API callers that send a
+                    # client_id but never connect would otherwise leak one worker websocket per id, until the
+                    # connection pool (100) is exhausted and every worker request hangs.
+                    self.connected_client_ids.add(client_id)
+                    await self.ensure_bridge(worker, client_id)
             try:
                 response = await self._post_worker(worker, "/prompt", json_data)
                 if response.status < 500:
@@ -1256,6 +1272,7 @@ class MultiGpuOrchestrator:
             worker.url + route,
             json=payload,
             headers={"Comfy-Usage-Source": "comfyui-mgpu-orchestrator"},
+            timeout=WORKER_POST_TIMEOUT,
         )
 
     def _remember_prompt_worker(
@@ -1405,6 +1422,26 @@ class MultiGpuOrchestrator:
     def _copy_response_headers(response: aiohttp.ClientResponse) -> dict[str, str]:
         allowed = {"Content-Type", "Content-Disposition", "Content-Length", "X-Content-Type-Options"}
         return {key: value for key, value in response.headers.items() if key in allowed}
+
+    def _client_has_socket(self, client_id: str) -> bool:
+        sockets = getattr(self.prompt_server, "sockets", None)
+        return isinstance(sockets, dict) and client_id in sockets
+
+    async def _reap_bridges(self) -> None:
+        """Close worker websocket bridges whose client is no longer connected to this server."""
+        while not self._closing:
+            await asyncio.sleep(BRIDGE_REAP_INTERVAL_SECONDS)
+            try:
+                for worker in list(self.workers):
+                    for client_id, task in list(worker.client_bridge_tasks.items()):
+                        if task.done() or not self._client_has_socket(client_id):
+                            if not task.done():
+                                task.cancel()
+                            worker.client_bridge_tasks.pop(client_id, None)
+                            worker.client_bridge_ready.pop(client_id, None)
+                self.connected_client_ids = {c for c in self.connected_client_ids if self._client_has_socket(c)}
+            except Exception:
+                logging.debug("%s Bridge cleanup deferred", LOG_PREFIX, exc_info=True)
 
     async def ensure_bridge(self, worker: WorkerState, client_id: str) -> bool:
         task = worker.client_bridge_tasks.get(client_id)
