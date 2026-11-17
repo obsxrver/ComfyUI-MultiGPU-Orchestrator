@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -745,6 +746,66 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response, "native-response")
         native_handler.assert_awaited_once_with(request)
         orchestrator.proxy_prompt.assert_not_awaited()
+
+    def _bridge_test_orchestrator(self, sockets):
+        prompt_server = FakePromptServer()
+        prompt_server.sockets = sockets
+        orchestrator = MultiGpuOrchestrator(prompt_server=prompt_server)
+        orchestrator._started = True
+        orchestrator.workers = [
+            WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000", status="healthy")
+        ]
+        orchestrator.refresh_queues = AsyncMock()
+        orchestrator.refresh_worker_queue = AsyncMock()
+        orchestrator._send_aggregate_status = AsyncMock()
+        orchestrator.ensure_bridge = AsyncMock(return_value=True)
+        response = SimpleNamespace(status=200, read=AsyncMock(return_value=b'{"prompt_id": "p1", "number": 1}'),
+                                   headers={"Content-Type": "application/json"})
+        orchestrator._post_worker = AsyncMock(return_value=response)
+        return orchestrator
+
+    async def test_prompt_proxy_does_not_bridge_api_client_without_websocket(self):
+        # An API caller sends a fresh client_id per job but never opens a websocket: no bridge may be opened,
+        # or every job leaks one worker websocket until the 100-connection pool is exhausted.
+        orchestrator = self._bridge_test_orchestrator(sockets={})
+        request = SimpleNamespace(json=AsyncMock(return_value={"prompt": {}, "client_id": "api-job-1"}))
+
+        await orchestrator.proxy_prompt(request)
+
+        orchestrator.ensure_bridge.assert_not_awaited()
+        orchestrator._post_worker.assert_awaited_once()
+        self.assertNotIn("api-job-1", orchestrator.connected_client_ids)
+
+    async def test_prompt_proxy_bridges_client_with_websocket(self):
+        orchestrator = self._bridge_test_orchestrator(sockets={"browser-1": object()})
+        request = SimpleNamespace(json=AsyncMock(return_value={"prompt": {}, "client_id": "browser-1"}))
+
+        await orchestrator.proxy_prompt(request)
+
+        orchestrator.ensure_bridge.assert_awaited_once()
+        self.assertIn("browser-1", orchestrator.connected_client_ids)
+
+    async def test_bridge_reaper_closes_bridges_of_disconnected_clients(self):
+        orchestrator = self._bridge_test_orchestrator(sockets={"still-here": object()})
+        worker = orchestrator.workers[0]
+        gone = asyncio.create_task(asyncio.sleep(3600))
+        here = asyncio.create_task(asyncio.sleep(3600))
+        worker.client_bridge_tasks.update({"gone": gone, "still-here": here})
+        orchestrator.connected_client_ids.update({"gone", "still-here"})
+
+        with patch("orchestrator.BRIDGE_REAP_INTERVAL_SECONDS", 0):
+            reaper = asyncio.create_task(orchestrator._reap_bridges())
+            await asyncio.sleep(0.05)
+            orchestrator._closing = True
+            await asyncio.sleep(0.01)
+            reaper.cancel()
+            await asyncio.gather(reaper, return_exceptions=True)
+
+        self.assertTrue(gone.cancelled())
+        self.assertNotIn("gone", worker.client_bridge_tasks)
+        self.assertIn("still-here", worker.client_bridge_tasks)
+        self.assertEqual(orchestrator.connected_client_ids, {"still-here"})
+        here.cancel()
 
     async def test_prompt_proxy_uses_native_fallback_without_healthy_workers(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
