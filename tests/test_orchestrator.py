@@ -345,8 +345,8 @@ class FakeSession:
     def __init__(self):
         self.calls = []
 
-    async def request(self, method, url):
-        self.calls.append((method, url))
+    async def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
         return SimpleNamespace(status=200)
 
 
@@ -881,7 +881,9 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
         response = await orchestrator._request_worker_response(worker, "HEAD", "/api/assets/hash/blake3:test")
 
         self.assertEqual(response.status, 200)
-        self.assertEqual(session.calls, [("HEAD", "http://127.0.0.1:9000/api/assets/hash/blake3:test")])
+        method, url, kwargs = session.calls[0]
+        self.assertEqual((method, url), ("HEAD", "http://127.0.0.1:9000/api/assets/hash/blake3:test"))
+        self.assertIsNotNone(kwargs["timeout"])
 
     async def test_worker_log_response_returns_requested_worker_chunk(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1040,7 +1042,7 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(popen.call_args.kwargs["env"][PARENT_PID_ENV], str(os.getpid()))
 
-    async def test_failed_auto_respawn_is_blocked_until_manual_restart(self):
+    async def test_failed_auto_respawn_retries_with_backoff(self):
         orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
         worker = WorkerState(
             gpu_index=0,
@@ -1061,9 +1063,126 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
         orchestrator._start_worker_with_retry = fake_start
 
         self.assertTrue(await orchestrator._handle_exited_worker(worker))
-        self.assertTrue(worker.respawn_blocked)
+        self.assertFalse(orchestrator._respawn_due(worker))
+        self.assertGreater(worker.next_respawn_at, 0.0)
+        # Within the backoff window the exit is still handled but not retried.
         self.assertTrue(await orchestrator._handle_exited_worker(worker))
         self.assertEqual(attempts, 1)
+        # Once the backoff expires, the next check respawns again.
+        worker.next_respawn_at = 0.0
+        self.assertTrue(await orchestrator._handle_exited_worker(worker))
+        self.assertEqual(attempts, 2)
+        self.assertEqual(worker.respawn_attempts, 2)
+
+    async def test_failed_worker_without_process_is_retried_when_due(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        worker = WorkerState(
+            gpu_index=0,
+            port=9000,
+            url="http://127.0.0.1:9000",
+            process=None,
+            status="failed",
+            error="startup timed out",
+        )
+        attempts = 0
+
+        async def fake_start(refreshed_worker, *, prefer_existing_port):
+            nonlocal attempts
+            attempts += 1
+            refreshed_worker.process = FakeProcess(returncode=None)
+            refreshed_worker.status = "healthy"
+            return True
+
+        orchestrator._start_worker_with_retry = fake_start
+        orchestrator._connect_worker_to_registered_clients = AsyncMock()
+
+        self.assertTrue(await orchestrator._handle_exited_worker(worker))
+        self.assertEqual(attempts, 1)
+        self.assertEqual(worker.status, "healthy")
+        self.assertEqual(worker.respawn_attempts, 0)
+        self.assertEqual(worker.next_respawn_at, 0.0)
+
+    async def test_healthcheck_marks_unresponsive_worker_and_restarts_it(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        worker = WorkerState(
+            gpu_index=0,
+            port=9000,
+            url="http://127.0.0.1:9000",
+            process=FakeProcess(returncode=None),
+            status="healthy",
+        )
+        orchestrator.workers = [worker]
+        orchestrator._fetch_worker_json = AsyncMock(side_effect=asyncio.TimeoutError)
+        restarted = []
+
+        async def fake_restart(gpu_index):
+            restarted.append(gpu_index)
+            worker.healthcheck_failures = 0
+            return worker
+
+        orchestrator.restart_worker = fake_restart
+
+        for expected_failures in (1, 2):
+            await orchestrator._check_worker(worker)
+            self.assertEqual(worker.healthcheck_failures, expected_failures)
+            self.assertEqual(worker.status, "unhealthy")
+            self.assertEqual(restarted, [])
+
+        await orchestrator._check_worker(worker)
+        self.assertEqual(restarted, [0])
+
+    async def test_healthcheck_recovers_worker_and_reconnects_stale_bridges(self):
+        prompt_server = FakePromptServer()
+        prompt_server.sockets = {"client-live": object()}
+        orchestrator = MultiGpuOrchestrator(prompt_server=prompt_server)
+        worker = WorkerState(
+            gpu_index=0,
+            port=9000,
+            url="http://127.0.0.1:9000",
+            process=FakeProcess(returncode=None),
+            status="unhealthy",
+            error="healthcheck failed: boom",
+        )
+        orchestrator.workers = [worker]
+        orchestrator.connected_client_ids.update({"client-live", "client-gone"})
+        done_task = asyncio.ensure_future(asyncio.sleep(0))
+        await done_task
+        worker.client_bridge_tasks["client-gone"] = done_task
+        worker.client_bridge_tasks["client-live"] = done_task
+        orchestrator._fetch_worker_json = AsyncMock(return_value={})
+        orchestrator.refresh_worker_queue = AsyncMock()
+        bridged = []
+
+        async def fake_bridge(worker, client_id):
+            bridged.append(client_id)
+            return True
+
+        orchestrator.ensure_bridge = fake_bridge
+
+        await orchestrator._check_worker(worker)
+
+        self.assertEqual(worker.status, "healthy")
+        self.assertIsNone(worker.error)
+        self.assertEqual(worker.healthcheck_failures, 0)
+        self.assertEqual(orchestrator.connected_client_ids, {"client-live"})
+        self.assertEqual(bridged, ["client-live"])
+        self.assertNotIn("client-live", worker.client_bridge_tasks)
+
+    async def test_healthcheck_skips_starting_and_stopped_workers(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        starting = WorkerState(gpu_index=0, port=9000, url="http://127.0.0.1:9000", status="starting")
+        stopped = WorkerState(gpu_index=1, port=9001, url="http://127.0.0.1:9001", status="stopped")
+        starting.process = FakeProcess(returncode=None)
+        stopped.process = FakeProcess(returncode=None)
+        orchestrator.workers = [starting, stopped]
+        orchestrator._fetch_worker_json = AsyncMock()
+
+        await orchestrator._check_worker(starting)
+        await orchestrator._check_worker(stopped)
+
+        orchestrator._fetch_worker_json.assert_not_awaited()
+        self.assertEqual(starting.status, "starting")
+        self.assertEqual(stopped.status, "stopped")
 
 
 if __name__ == "__main__":
