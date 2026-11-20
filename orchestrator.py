@@ -34,6 +34,15 @@ LOG_DIR_ENV = "COMFYUI_MGPU_LOG_DIR"
 WORKER_LOG_READ_LIMIT = 256 * 1024
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_JOBS_FETCH_LIMIT = 1000
+WORKER_TIMEOUT_ENV = "COMFYUI_MGPU_WORKER_TIMEOUT"
+DEFAULT_WORKER_TIMEOUT_SECONDS = 60.0
+HEALTHCHECK_INTERVAL_ENV = "COMFYUI_MGPU_HEALTHCHECK_INTERVAL"
+DEFAULT_HEALTHCHECK_INTERVAL_SECONDS = 15.0
+HEALTHCHECK_PING_TIMEOUT_SECONDS = 5.0
+UNRESPONSIVE_RESTART_THRESHOLD = 3
+RESPAWN_RETRY_BASE_SECONDS = 5.0
+RESPAWN_RETRY_MAX_SECONDS = 60.0
+RESPAWN_RETRY_CUDA_SECONDS = 600.0
 ADDRESS_IN_USE_MARKERS = (
     "address already in use",
     "address is already in use",
@@ -148,7 +157,9 @@ class WorkerState:
     client_bridge_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     client_bridge_ready: dict[str, asyncio.Event] = field(default_factory=dict)
     respawning: bool = False
-    respawn_blocked: bool = False
+    respawn_attempts: int = 0
+    next_respawn_at: float = 0.0
+    healthcheck_failures: int = 0
 
     @property
     def load(self) -> int:
@@ -172,6 +183,9 @@ class WorkerState:
             "pid": self.process.pid if self.process else None,
             "log_path": self.log_path,
             "tracked_pending": len(self.pending_prompt_payloads),
+            "respawn_attempts": self.respawn_attempts,
+            "next_respawn_in": max(self.next_respawn_at - time.monotonic(), 0.0),
+            "healthcheck_failures": self.healthcheck_failures,
         }
 
 
@@ -718,6 +732,14 @@ class MultiGpuOrchestrator:
         self.startup_timeout = float(
             os.environ.get("COMFYUI_MGPU_STARTUP_TIMEOUT", DEFAULT_STARTUP_TIMEOUT_SECONDS)
         )
+        self.worker_request_timeout = float(
+            os.environ.get(WORKER_TIMEOUT_ENV, DEFAULT_WORKER_TIMEOUT_SECONDS)
+        )
+        self.healthcheck_interval = float(
+            os.environ.get(HEALTHCHECK_INTERVAL_ENV, DEFAULT_HEALTHCHECK_INTERVAL_SECONDS)
+        )
+        self._worker_request_timeout: aiohttp.ClientTimeout | None = None
+        self._monitor_task: asyncio.Task | None = None
         self.comfy_root = find_comfy_root()
 
     @staticmethod
@@ -727,6 +749,11 @@ class MultiGpuOrchestrator:
         except Exception:
             return None
         return comfy_args
+
+    def _request_timeout(self) -> Any:
+        if self._worker_request_timeout is None:
+            self._worker_request_timeout = aiohttp.ClientTimeout(total=self.worker_request_timeout)
+        return self._worker_request_timeout
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -762,6 +789,8 @@ class MultiGpuOrchestrator:
                 self._spawn_worker(worker, self._comfy_args)
 
             await asyncio.gather(*(self._wait_for_worker(worker) for worker in self.workers))
+            if self.workers and (self._monitor_task is None or self._monitor_task.done()):
+                self._monitor_task = asyncio.create_task(self._monitor_loop())
 
     async def close(self) -> None:
         if self._closing:
@@ -771,6 +800,10 @@ class MultiGpuOrchestrator:
             self._history_sync_task.cancel()
             await asyncio.gather(self._history_sync_task, return_exceptions=True)
             self._history_sync_task = None
+        if self._monitor_task is not None:
+            self._monitor_task.cancel()
+            await asyncio.gather(self._monitor_task, return_exceptions=True)
+            self._monitor_task = None
         self._pending_history.clear()
         for worker in self.workers:
             for task in worker.client_bridge_tasks.values():
@@ -859,30 +892,161 @@ class MultiGpuOrchestrator:
     def _has_marker(text: str, markers: tuple[str, ...]) -> bool:
         return any(marker in text for marker in markers)
 
+    def _respawn_due(self, worker: WorkerState) -> bool:
+        return worker.next_respawn_at <= time.monotonic()
+
+    def _schedule_respawn_retry(self, worker: WorkerState) -> None:
+        worker.respawn_attempts += 1
+        delay = min(
+            RESPAWN_RETRY_BASE_SECONDS * (2 ** (worker.respawn_attempts - 1)),
+            RESPAWN_RETRY_MAX_SECONDS,
+        )
+        if self._has_marker(self._worker_log_tail(worker), CUDA_ERROR_MARKERS):
+            # A CUDA-level failure is less likely to heal quickly, but retrying
+            # after a long pause still recovers from transient VRAM conflicts.
+            delay = max(delay, RESPAWN_RETRY_CUDA_SECONDS)
+        worker.next_respawn_at = time.monotonic() + delay
+        logging.warning(
+            "%s Will retry worker for GPU %s in %.0fs (attempt %s)",
+            LOG_PREFIX,
+            worker.gpu_index,
+            delay,
+            worker.respawn_attempts,
+        )
+
     async def _handle_exited_worker(self, worker: WorkerState) -> bool:
         process = worker.process
-        if process is None or process.poll() is None:
+        if process is not None and process.poll() is None:
+            return False
+        if process is None and worker.status != "failed":
+            # Never started or managed elsewhere (e.g. stopped); nothing to do.
             return False
         if worker.status not in {"failed", "stopped"}:
             worker.status = "failed"
-            worker.error = f"worker exited with code {process.returncode}"
+            if process is not None:
+                worker.error = f"worker exited with code {process.returncode}"
+            else:
+                worker.error = "worker process is not running"
             worker.running = 0
             worker.pending = 0
             logging.warning(
-                "%s Worker for GPU %s exited with code %s%s",
+                "%s Worker for GPU %s %s%s",
                 LOG_PREFIX,
                 worker.gpu_index,
-                process.returncode,
+                worker.error,
                 f"; see {worker.log_path}" if worker.log_path else "",
             )
         if (
             worker.status != "stopped"
             and not self._closing
             and self.auto_respawn
-            and not worker.respawn_blocked
+            and self._respawn_due(worker)
         ):
             await self._respawn_worker(worker)
         return True
+
+    async def _monitor_loop(self) -> None:
+        # Workers otherwise go unchecked while idle: a worker that dies or
+        # wedges during a quiet period would only be discovered by the next
+        # client request (which then pays the recovery cost itself).
+        while not self._closing:
+            await asyncio.sleep(self.healthcheck_interval)
+            if self._closing:
+                break
+            try:
+                await self._run_health_checks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.debug("%s Worker health checks failed", LOG_PREFIX, exc_info=True)
+
+    async def _run_health_checks(self) -> None:
+        for worker in list(self.workers):
+            if self._closing:
+                return
+            try:
+                await self._check_worker(worker)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.debug(
+                    "%s Health check error for GPU %s",
+                    LOG_PREFIX,
+                    worker.gpu_index,
+                    exc_info=True,
+                )
+
+    async def _check_worker(self, worker: WorkerState) -> None:
+        if worker.respawning:
+            return
+        if await self._handle_exited_worker(worker):
+            return
+        if worker.status in {"stopped", "new", "starting"}:
+            # Stopped workers are managed explicitly; starting ones have their
+            # own deadline in _wait_for_worker.
+            return
+        try:
+            await asyncio.wait_for(
+                self._fetch_worker_json(worker, "/system_stats"),
+                timeout=HEALTHCHECK_PING_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            worker.healthcheck_failures += 1
+            if worker.status not in {"failed", "stopped"}:
+                worker.status = "unhealthy"
+                worker.error = f"healthcheck failed: {exc}"
+            if worker.healthcheck_failures >= UNRESPONSIVE_RESTART_THRESHOLD:
+                logging.warning(
+                    "%s Worker for GPU %s failed %s health checks; restarting it",
+                    LOG_PREFIX,
+                    worker.gpu_index,
+                    worker.healthcheck_failures,
+                )
+                await self.restart_worker(worker.gpu_index)
+            return
+        worker.healthcheck_failures = 0
+        if worker.status in {"unhealthy", "failed"}:
+            logging.info(
+                "%s Worker for GPU %s is responsive again; marking it healthy",
+                LOG_PREFIX,
+                worker.gpu_index,
+            )
+            worker.status = "healthy"
+            worker.error = None
+        worker.last_seen = time.time()
+        await self.refresh_worker_queue(worker)
+        await self._reconnect_stale_bridges(worker)
+
+    async def _reconnect_stale_bridges(self, worker: WorkerState) -> None:
+        sockets = getattr(self.prompt_server, "sockets", None)
+        if isinstance(sockets, dict):
+            self.connected_client_ids.intersection_update(str(key) for key in sockets)
+        finished_clients = [
+            client_id
+            for client_id, task in worker.client_bridge_tasks.items()
+            if task.done()
+        ]
+        if not finished_clients:
+            return
+        for client_id in finished_clients:
+            worker.client_bridge_tasks.pop(client_id, None)
+            worker.client_bridge_ready.pop(client_id, None)
+        reconnect_clients = [
+            client_id for client_id in finished_clients if client_id in self.connected_client_ids
+        ]
+        if reconnect_clients:
+            logging.info(
+                "%s Reconnecting %s worker bridge(s) for GPU %s",
+                LOG_PREFIX,
+                len(reconnect_clients),
+                worker.gpu_index,
+            )
+            await asyncio.gather(
+                *(self.ensure_bridge(worker, client_id) for client_id in reconnect_clients),
+                return_exceptions=True,
+            )
 
     async def stop_worker(self, gpu_index: int) -> WorkerState | None:
         worker = self._worker_for_gpu(gpu_index)
@@ -895,7 +1059,9 @@ class MultiGpuOrchestrator:
         worker.running = 0
         worker.pending = 0
         worker.last_seen = None
-        worker.respawn_blocked = False
+        worker.respawn_attempts = 0
+        worker.next_respawn_at = 0.0
+        worker.healthcheck_failures = 0
         return worker
 
     async def restart_worker(self, gpu_index: int) -> WorkerState | None:
@@ -905,7 +1071,9 @@ class MultiGpuOrchestrator:
         await self._ensure_session()
         self._forget_worker_runtime_state(worker)
         await self._terminate_worker_process(worker)
-        worker.respawn_blocked = False
+        worker.respawn_attempts = 0
+        worker.next_respawn_at = 0.0
+        worker.healthcheck_failures = 0
         if self._comfy_args is None:
             self._comfy_args = self._load_comfy_args()
         await self._start_worker_with_retry(worker, prefer_existing_port=False)
@@ -929,9 +1097,11 @@ class MultiGpuOrchestrator:
             if self._comfy_args is None:
                 self._comfy_args = self._load_comfy_args()
             if not await self._start_worker_with_retry(worker, prefer_existing_port=True):
-                worker.respawn_blocked = True
+                self._schedule_respawn_retry(worker)
                 return False
-            worker.respawn_blocked = False
+            worker.respawn_attempts = 0
+            worker.next_respawn_at = 0.0
+            worker.healthcheck_failures = 0
             await self._connect_worker_to_registered_clients(worker)
             if pending_count:
                 if self.requeue_pending_on_respawn:
@@ -1085,7 +1255,9 @@ class MultiGpuOrchestrator:
     async def _fetch_worker_json(self, worker: WorkerState, route: str) -> Any:
         if self._session is None:
             raise RuntimeError("orchestrator session is not ready")
-        async with self._session.get(worker.url + route) as response:
+        async with self._session.get(
+            worker.url + route, timeout=self._request_timeout()
+        ) as response:
             response.raise_for_status()
             return await response.json()
 
@@ -1098,7 +1270,9 @@ class MultiGpuOrchestrator:
         if self._session is None:
             raise RuntimeError("orchestrator session is not ready")
         query_string = f"?{urlencode(query, doseq=True)}" if query else ""
-        async with self._session.get(worker.url + route + query_string) as response:
+        async with self._session.get(
+            worker.url + route + query_string, timeout=self._request_timeout()
+        ) as response:
             response.raise_for_status()
             return await response.json()
 
@@ -1256,6 +1430,7 @@ class MultiGpuOrchestrator:
             worker.url + route,
             json=payload,
             headers={"Comfy-Usage-Source": "comfyui-mgpu-orchestrator"},
+            timeout=self._request_timeout(),
         )
 
     def _remember_prompt_worker(
@@ -1292,6 +1467,8 @@ class MultiGpuOrchestrator:
         prompt_id = str(prompt_id)
         worker.accepted_prompt_ids.discard(prompt_id)
         worker.pending_prompt_payloads.pop(prompt_id, None)
+        self.prompt_progress.pop(prompt_id, None)
+        self.prompt_metadata.pop(prompt_id, None)
 
     @staticmethod
     def _queue_prompt_ids(data: Any) -> set[str] | None:
@@ -2090,22 +2267,32 @@ class MultiGpuOrchestrator:
                         for pid in pending:
                             self._pending_history.pop(pid, None)
                         continue
-                    try:
-                        # Read queue first: a job absent from this snapshot has
-                        # already entered history or was deleted without execution.
-                        queue = await asyncio.wait_for(self._fetch_worker_json(worker, "/queue"), timeout=5)
-                        active = self._queue_prompt_ids(queue)
-                        if active is None:
-                            continue
-                        finished = pending - active
-                        if not finished:
-                            continue
-                        prompt_id = next(iter(finished)) if len(finished) == 1 else None
-                        self._merge_parent_history(await self._worker_history(worker, prompt_id))
-                        for pid in finished:
-                            self._pending_history.pop(pid, None)
-                    except Exception:
-                        logging.debug("%s Pending history synchronization deferred", LOG_PREFIX, exc_info=True)
+                try:
+                    # Read queue first: a job absent from this snapshot has
+                    # already entered history or was deleted without execution.
+                    # Network calls run outside _history_lock so history reads
+                    # from client requests are never blocked behind them.
+                    queue = await asyncio.wait_for(self._fetch_worker_json(worker, "/queue"), timeout=5)
+                    active = self._queue_prompt_ids(queue)
+                    if active is None:
+                        continue
+                    finished = pending - active
+                    if not finished:
+                        continue
+                    prompt_id = next(iter(finished)) if len(finished) == 1 else None
+                    history = await self._worker_history(worker, prompt_id)
+                except Exception:
+                    logging.debug("%s Pending history synchronization deferred", LOG_PREFIX, exc_info=True)
+                    continue
+                async with self._history_lock:
+                    # Entries may have been merged, deleted, or re-queued while
+                    # we fetched; only settle the ones still pending for this worker.
+                    finished = {pid for pid in finished if self._pending_history.get(pid) is worker}
+                    if not finished:
+                        continue
+                    self._merge_parent_history(history)
+                    for pid in finished:
+                        self._pending_history.pop(pid, None)
             if self._pending_history:
                 await asyncio.sleep(1)
 
@@ -2188,7 +2375,9 @@ class MultiGpuOrchestrator:
     ) -> aiohttp.ClientResponse:
         if self._session is None:
             raise RuntimeError("orchestrator session is not ready")
-        return await self._session.request(method, worker.url + route)
+        return await self._session.request(
+            method, worker.url + route, timeout=self._request_timeout()
+        )
 
     async def _fetch_worker_payloads(
         self,
