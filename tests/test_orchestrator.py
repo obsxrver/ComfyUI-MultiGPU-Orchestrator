@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import sys
@@ -94,6 +95,23 @@ class OrchestratorPureTests(unittest.TestCase):
         self.assertIn("/comfy/extra.yaml", command)
         self.assertIn("--disable-assets", command)
         self.assertNotIn("--enable-assets", command)
+
+    def test_worker_preserves_grouped_extra_model_paths(self):
+        # ComfyUI declares action="append" and nargs="+", giving one list per flag.
+        parser = argparse.ArgumentParser()
+        flag = "--extra-model-paths-config"
+        parser.add_argument(flag, action="append", nargs="+", type=str)
+        first = r"D:\Swarm UI\Data\comfy-auto-model.yaml"
+        second = r"D:\Model library\extras.yaml"
+        third = r"C:\ComfyUI\configs\local.yaml"
+        parent = parser.parse_args([flag, first, second, flag, third])
+
+        command = build_worker_command(
+            0, 9123, comfy_root=Path("/comfy"), comfy_args=parent,
+        )
+        worker, _ = parser.parse_known_args(command[2:])
+        self.assertEqual(worker.extra_model_paths_config, [[first, second], [third]])
+        self.assertEqual(command.count(flag), 2)
 
     def test_worker_log_path_is_stable_per_gpu(self):
         with tempfile.TemporaryDirectory() as tmpdir:

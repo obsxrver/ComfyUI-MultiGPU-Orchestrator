@@ -301,8 +301,16 @@ def build_worker_command(
         _optional_path_flag(command, "--input-directory", getattr(comfy_args, "input_directory", None))
         _optional_path_flag(command, "--temp-directory", getattr(comfy_args, "temp_directory", None))
         _optional_path_flag(command, "--user-directory", getattr(comfy_args, "user_directory", None))
-        for config_path in getattr(comfy_args, "extra_model_paths_config", []) or []:
-            _optional_path_flag(command, "--extra-model-paths-config", config_path)
+        # ComfyUI argparse uses action="append", nargs="+": preserve the groups
+        # and pass each path as its own argv token (including paths with spaces).
+        configs = getattr(comfy_args, "extra_model_paths_config", None)
+        if isinstance(configs, (str, os.PathLike)):
+            configs = [configs]
+        for config in configs or ():
+            group = config if isinstance(config, (list, tuple)) else (config,)
+            paths = [os.fsdecode(path) for path in group if path]
+            if paths:
+                command.extend(["--extra-model-paths-config", *paths])
 
     extra_flags = os.environ.get("COMFYUI_MGPU_WORKER_FLAGS", "").strip()
     if extra_flags:
